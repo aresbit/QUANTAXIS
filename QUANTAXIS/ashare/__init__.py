@@ -1,4 +1,4 @@
-"""Minimal QUANTAXIS build focused on China A-share execution."""
+"""China A-share trading toolkit."""
 
 from QUANTAXIS.ashare.account import AccountSnapshot, Position
 from QUANTAXIS.ashare.broker import EasyTraderBroker, ExecutionReport, Order, PaperBroker
@@ -16,6 +16,3 @@ __all__ = [
     "Quote",
     "run_once_from_config",
 ]
-
-__author__ = "yutiansut"
-__version__ = "3.0.0"

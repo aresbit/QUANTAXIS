@@ -1,0 +1,14 @@
+quote:
+  provider: pytdx
+
+broker:
+  kind: easytrader
+  client: ths
+  prepare:
+    exe_path: "C:/同花顺软件/xiadan.exe"
+
+orders:
+  - symbol: "000001"
+    side: buy
+    amount: 100
+    price: market

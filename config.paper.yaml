@@ -1,0 +1,12 @@
+quote:
+  provider: pytdx
+
+broker:
+  kind: paper
+  initial_cash: 1000000
+
+orders:
+  - symbol: "000001"
+    side: buy
+    amount: 100
+    price: 12.34

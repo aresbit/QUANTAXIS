@@ -1,0 +1,28 @@
+[project]
+name = "quantaxis"
+version = "3.0.0"
+description = "Minimal QUANTAXIS build for China A-share trading"
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+  "pytdx>=1.72",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+live = [
+  "easytrader>=0.23.7",
+]
+
+[project.scripts]
+quantaxis-a = "QUANTAXIS.ashare.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["QUANTAXIS"]
