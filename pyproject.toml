@@ -5,6 +5,8 @@ description = "Minimal QUANTAXIS build for China A-share trading"
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
+  "numpy>=2.0",
+  "pandas>=2.2",
   "pytdx>=1.72",
   "pyyaml>=6.0",
 ]
@@ -12,6 +14,10 @@ dependencies = [
 [project.optional-dependencies]
 live = [
   "easytrader>=0.23.7",
+]
+research = [
+  "akshare>=1.17",
+  "matplotlib>=3.9",
 ]
 
 [project.scripts]

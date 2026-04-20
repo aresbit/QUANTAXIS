@@ -8,6 +8,10 @@
 - `paper` 本地撮合账户
 - `easytrader` 实盘适配口
 - YAML 批量下单入口
+- 本地 CSV 回测
+- 递归 `quant transformer` 风格研究策略
+- 历史 A 股日线抓取
+- 回测图直接导出 PNG
 
 移除内容：
 
@@ -47,6 +51,22 @@ uv run python -m QUANTAXIS paper-buy 000001 100 --price 12.34
 
 ```bash
 uv run python -m QUANTAXIS run --config config.paper.yaml
+
+回测：
+
+```bash
+uv run python -m QUANTAXIS backtest --csv data/sample_ohlcv.csv
+```
+
+直接抓 A 股历史数据回测并画图：
+
+```bash
+uv run python -m QUANTAXIS backtest \
+  --symbol 000001 \
+  --start 2020-01-01 \
+  --end 2024-12-31 \
+  --plot outputs/000001_backtest.png
+```
 ```
 
 ## 配置
@@ -93,3 +113,7 @@ orders:
 - `quote` 和 `price: market` 依赖 TDX 网络连通性。
 - `easytrader` 需要你自己的券商终端和登录态，只能在你的交易机上联调。
 - A 股手数默认限制为 `100` 的整数倍。
+- 回测 CSV 需要列：`datetime,open,high,low,close,volume`
+- 历史日线回测支持 `AKShare` 抓取：`--symbol/--start/--end`
+- 可视化支持 `--plot path.png`，输出价格/买卖点/信号/净值/回撤
+- 当前研究策略不是任何机构内部专有模型，而是一个可调参的本地研究骨架，融合了递归状态更新和缠论分型/笔强度特征。
