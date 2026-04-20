@@ -1,6 +1,6 @@
 # QUANTAXIS
 
-这个仓库已经被裁成一个纯本地、面向中国 A 股执行的最小版本。
+这个仓库当前是一个偏本地化、面向中国 A 股研究与执行的版本，同时保留了部分 legacy QUANTAXIS 模块用于兼容旧的分析、因子和策略链路。
 
 保留内容：
 
@@ -12,13 +12,14 @@
 - 递归 `quant transformer` 风格研究策略
 - 历史 A 股日线抓取
 - 回测图直接导出 PNG
+- legacy `QAAnalysis/QAFactor/QAStrategy/QAFetch` 模块
 
 移除内容：
 
 - Web
 - Docker
 - 文档站
-- 回测/因子/分析/多市场杂项
+- 大量与当前本地工作流无关的杂项与历史包袱
 - Rust 桥接和其他非交易路径
 
 ## 用 `uv`
@@ -51,6 +52,7 @@ uv run python -m QUANTAXIS paper-buy 000001 100 --price 12.34
 
 ```bash
 uv run python -m QUANTAXIS run --config config.paper.yaml
+```
 
 回测：
 
@@ -67,7 +69,17 @@ uv run python -m QUANTAXIS backtest \
   --end 2024-12-31 \
   --plot outputs/000001_backtest.png
 ```
+
+legacy 分析/因子链路：
+
+```bash
+uv sync --extra legacy
 ```
+
+中文文档：
+
+- [PROJECT_GUIDE.zh-CN.md](/home/ares/yys/QUANTAXIS/PROJECT_GUIDE.zh-CN.md)
+- [LEGACY_FACTOR_GUIDE.zh-CN.md](/home/ares/yys/QUANTAXIS/LEGACY_FACTOR_GUIDE.zh-CN.md)
 
 ## 配置
 
@@ -117,3 +129,4 @@ orders:
 - 历史日线回测支持 `AKShare` 抓取：`--symbol/--start/--end`
 - 可视化支持 `--plot path.png`，输出价格/买卖点/信号/净值/回撤
 - 当前研究策略不是任何机构内部专有模型，而是一个可调参的本地研究骨架，融合了递归状态更新和缠论分型/笔强度特征。
+- legacy 因子库依赖 `qaenv + ClickHouse + Mongo`，详见 [LEGACY_FACTOR_GUIDE.zh-CN.md](/home/ares/yys/QUANTAXIS/LEGACY_FACTOR_GUIDE.zh-CN.md)

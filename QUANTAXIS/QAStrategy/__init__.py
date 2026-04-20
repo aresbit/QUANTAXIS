@@ -2,6 +2,7 @@
 
 from QUANTAXIS.QAStrategy.util import QA_data_futuremin_resample
 from QUANTAXIS.QAStrategy.qactabase import QAStrategyCtaBase
+from QUANTAXIS.QAStrategy.plot import save_legacy_strategy_figure
 
 
 """
@@ -16,4 +17,3 @@ QAHedgeBase: 双标的对冲/套利的研究基类
 
 QAFactorBase: 因子工厂模式的研究基类
 """
-

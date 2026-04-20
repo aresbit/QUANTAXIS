@@ -5,6 +5,7 @@ import uuid
 import datetime
 import json
 import os
+from pathlib import Path
 import threading
 import requests
 import pandas as pd
@@ -16,8 +17,8 @@ import QUANTAXIS as QA
 
 from QUANTAXIS.QAEngine.QAThreadEngine import QA_Thread
 from QUANTAXIS.QAUtil.QAParameter import MARKET_TYPE, RUNNING_ENVIRONMENT, ORDER_DIRECTION
-from QAPUBSUB.consumer import subscriber_topic,  subscriber_routing
-from QAPUBSUB.producer import publisher_routing
+from QUANTAXIS.QAPubSub.consumer import subscriber_topic,  subscriber_routing
+from QUANTAXIS.QAPubSub.producer import publisher_routing
 from QUANTAXIS.QAStrategy.qactabase import QAStrategyCtaBase
 from QUANTAXIS.QIFI.QifiAccount import QIFI_Account
 
@@ -25,15 +26,19 @@ from QUANTAXIS.QIFI.QifiAccount import QIFI_Account
 class QAStrategyStockBase(QAStrategyCtaBase):
 
     def __init__(self, code=['000001'], frequence='1min', strategy_id='QA_STRATEGY', risk_check_gap=1, portfolio='default',
-                 start='2019-01-01', end='2019-10-21', send_wx=False, market_type='stock_cn',
+                 start='2019-01-01', end='2019-10-21', init_cash=1000000, send_wx=False, market_type='stock_cn',
                  data_host=eventmq_ip, data_port=eventmq_port, data_user=eventmq_username, data_password=eventmq_password,
                  trade_host=eventmq_ip, trade_port=eventmq_port, trade_user=eventmq_username, trade_password=eventmq_password,
-                 taskid=None, mongo_ip=mongo_ip):
+                 taskid=None, mongo_ip=mongo_ip, backtest_backend='mongo',
+                 sqlite_path='quantaxis_multistrategy.sqlite3', backtest_csv=None, backtest_data=None,
+                 backtest_adjust='', use_research_api=False):
         super().__init__(code=code, frequence=frequence, strategy_id=strategy_id, risk_check_gap=risk_check_gap, portfolio=portfolio,
-                         start=start, end=end, send_wx=send_wx,
+                         start=start, end=end, init_cash=init_cash, send_wx=send_wx,
                          data_host=eventmq_ip, data_port=eventmq_port, data_user=eventmq_username, data_password=eventmq_password,
                          trade_host=eventmq_ip, trade_port=eventmq_port, trade_user=eventmq_username, trade_password=eventmq_password,
-                         taskid=taskid, mongo_ip=mongo_ip)
+                         taskid=taskid, mongo_ip=mongo_ip, backtest_backend=backtest_backend,
+                         sqlite_path=sqlite_path, backtest_csv=backtest_csv, backtest_data=backtest_data,
+                         backtest_adjust=backtest_adjust, use_research_api=use_research_api)
 
         self.code = code
         self.send_wx = send_wx
@@ -141,6 +146,21 @@ class QAStrategyStockBase(QAStrategyCtaBase):
 
     def debug(self):
         self.running_mode = 'backtest'
+        if self.backtest_backend in ['sqlite', 'local']:
+            sqlite_file = str(Path(self.sqlite_path).expanduser())
+            self.acc = QIFI_Account(
+                username=self.strategy_id,
+                password=self.strategy_id,
+                trade_host=sqlite_file,
+                init_cash=self.init_cash,
+                model='BACKTEST',
+                dbname='sqlite'
+            )
+            self.acc.initial()
+            self.positions = self.acc.positions
+            data = self._load_local_backtest_data()
+            data.apply(self.x1, axis=1)
+            return
         # self.database = pymongo.MongoClient(mongo_ip).QUANTAXIS
         # user = QA_User(username="admin", password='admin')
         # port = user.new_portfolio(self.portfolio)
@@ -219,9 +239,12 @@ class QAStrategyStockBase(QAStrategyCtaBase):
 
             self.bar_order['{}_{}'.format(direction, offset)] = self.bar_id
 
-            self.acc.receive_simpledeal(
-                code=code, trade_time=self.running_time, trade_towards=towards, trade_amount=volume, trade_price=price, order_id=order_id)
-            #self.positions = self.acc.get_position(self.code)
+            order = self.acc.send_order(
+                code=code, amount=volume, datetime=self.running_time, towards=towards, price=price, order_id=order_id
+            )
+            if order:
+                self.acc.make_deal(order)
+            self.positions = self.acc.positions
 
 
 if __name__ == '__main__':

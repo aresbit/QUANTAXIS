@@ -2,6 +2,7 @@ import copy
 import datetime
 import json
 import os
+from pathlib import Path
 import re
 import sys
 import threading
@@ -17,6 +18,8 @@ from QUANTAXIS.QAPubSub.consumer import subscriber, subscriber_routing, subscrib
 from QUANTAXIS.QAPubSub.producer import publisher_routing, publisher_topic
 
 import QUANTAXIS as QA
+from QUANTAXIS.backtest.data import fetch_ashare_daily, load_ohlcv_csv
+from QUANTAXIS.QAStrategy.plot import save_legacy_strategy_figure
 from QUANTAXIS.QAStrategy.util import QA_data_futuremin_resample
 from QUANTAXIS.QIFI.QifiAccount import ORDER_DIRECTION, QIFI_Account
 from QUANTAXIS.QAMarket.market_preset import MARKET_PRESET
@@ -29,7 +32,9 @@ class QAStrategyCtaBase():
                  start='2020-01-01', end='2020-05-21', init_cash=1000000, send_wx=False,
                  data_host=eventmq_ip, data_port=eventmq_port, data_user=eventmq_username, data_password=eventmq_password,
                  trade_host=eventmq_ip, trade_port=eventmq_port, trade_user=eventmq_username, trade_password=eventmq_password,
-                 taskid=None, mongo_ip=mongo_ip, model='py'):
+                 taskid=None, mongo_ip=mongo_ip, model='py', backtest_backend='mongo',
+                 sqlite_path='quantaxis_strategy.sqlite3', backtest_csv=None, backtest_data=None,
+                 backtest_adjust='', use_research_api=False):
         """
         code 可以传入单个标的 也可以传入一组标的(list)
         会自动基于code来判断是什么市场
@@ -60,6 +65,12 @@ class QAStrategyCtaBase():
         self.end = end
         self.init_cash = init_cash
         self.taskid = taskid
+        self.backtest_backend = backtest_backend
+        self.sqlite_path = sqlite_path
+        self.backtest_csv = backtest_csv
+        self.backtest_data = backtest_data
+        self.backtest_adjust = backtest_adjust
+        self.use_research_api = use_research_api
 
         self.running_time = ''
 
@@ -93,7 +104,59 @@ class QAStrategyCtaBase():
 
         self._num_cached = 120
         self._cached_data = []
+        self._account_snapshots = []
         self.user_init()
+
+    def _normalize_backtest_data(self, data):
+        if data is None:
+            raise ValueError('local backtest mode requires backtest_data or backtest_csv')
+        if hasattr(data, 'data'):
+            frame = data.data.copy()
+        else:
+            frame = data.copy()
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError('backtest data must be a pandas DataFrame or a DataStruct with `.data`')
+        if {'datetime', 'code'}.issubset(frame.columns):
+            normalized = frame.copy()
+        elif isinstance(frame.index, pd.MultiIndex) and list(frame.index.names)[:2] == ['datetime', 'code']:
+            normalized = frame.reset_index()
+        else:
+            normalized = frame.reset_index()
+            if 'datetime' not in normalized.columns:
+                renamed = {normalized.columns[0]: 'datetime'}
+                normalized = normalized.rename(columns=renamed)
+            if 'code' not in normalized.columns:
+                normalized['code'] = self.get_code()
+        if 'symbol' in normalized.columns and 'code' not in normalized.columns:
+            normalized = normalized.rename(columns={'symbol': 'code'})
+        if 'code' not in normalized.columns:
+            normalized['code'] = self.get_code()
+        required = {'datetime', 'code', 'open', 'high', 'low', 'close', 'volume'}
+        missing = required - set(normalized.columns)
+        if missing:
+            raise ValueError(f'backtest data missing columns: {sorted(missing)}')
+        normalized = normalized.loc[:, ['datetime', 'code', 'open', 'high', 'low', 'close', 'volume']].copy()
+        normalized['datetime'] = pd.to_datetime(normalized['datetime'])
+        normalized['code'] = normalized['code'].astype(str)
+        return normalized.set_index(['datetime', 'code']).sort_index()
+
+    def _load_local_backtest_data(self):
+        if self.backtest_data is not None:
+            return self._normalize_backtest_data(self.backtest_data)
+        if self.backtest_csv:
+            return self._normalize_backtest_data(load_ohlcv_csv(self.backtest_csv))
+        if self.use_research_api and self.market_type == MARKET_TYPE.STOCK_CN:
+            return self._normalize_backtest_data(
+                fetch_ashare_daily(
+                    symbol=self.get_code(),
+                    start_date=self.start,
+                    end_date=self.end,
+                    adjust=self.backtest_adjust,
+                )
+            )
+        raise ValueError(
+            'sqlite/local backtest requires `backtest_data`, `backtest_csv`, or `use_research_api=True` for A-share history'
+        )
 
     @property
     def bar_id(self):
@@ -180,7 +243,8 @@ class QAStrategyCtaBase():
 
     def run_backtest(self):
         self.debug()
-        self.acc.save()
+        if self.backtest_backend in ['sqlite', 'local']:
+            return self.acc.message
 
         risk = QA_Risk(self.acc)
         risk.save()
@@ -194,6 +258,7 @@ class QAStrategyCtaBase():
             QA_Rank(self.acc).send()
         except:
             pass
+        return self.acc.message
 
     def user_init(self):
         """
@@ -203,6 +268,21 @@ class QAStrategyCtaBase():
 
     def debug(self):
         self.running_mode = 'backtest'
+        if self.backtest_backend in ['sqlite', 'local']:
+            sqlite_file = str(Path(self.sqlite_path).expanduser())
+            self.acc = QIFI_Account(
+                username=self.strategy_id,
+                password=self.strategy_id,
+                trade_host=sqlite_file,
+                init_cash=self.init_cash,
+                model='BACKTEST',
+                dbname='sqlite'
+            )
+            self.acc.initial()
+            self.positions = self.acc.get_position(self.get_code())
+            data = self._load_local_backtest_data()
+            data.apply(self.x1, axis=1)
+            return
         self.database = pymongo.MongoClient(mongo_ip).QUANTAXIS
         user = QA_User(username=self.username, password=self.password)
         port = user.new_portfolio(self.portfolio)
@@ -229,6 +309,13 @@ class QAStrategyCtaBase():
         self._market_data.append(copy.deepcopy(item))
         self.running_time = str(item.name[0])
         self.on_bar(item)
+        self._account_snapshots.append({
+            'datetime': str(item.name[0]),
+            'code': item.name[1],
+            'close': float(item['close']),
+            'available': float(self.acc.available),
+            'balance': float(self.acc.balance),
+        })
 
     def debug_t0(self):
         self.running_mode = 'backtest'
@@ -662,6 +749,9 @@ class QAStrategyCtaBase():
         self._systemvar[name] = {'datetime': copy.deepcopy(str(
             self.running_time)), 'value': data, 'format': format}
 
+    def save_plot(self, output_path, title=None):
+        return save_legacy_strategy_figure(self, output_path=output_path, title=title or self.strategy_id)
+
     def get_code(self):
         if isinstance(self.code, str):
             return self.code
@@ -756,10 +846,9 @@ class QAStrategyCtaBase():
 
             if self.market_type == 'stock_cn':
                 order = self.acc.send_order(
-                    code=code, amount=volume, time=self.running_time, towards=towards, price=price)
-                order.trade(order.order_id, order.price,
-                            order.amount, order.datetime)
-                self.on_deal(order.to_dict())
+                    code=code, amount=volume, datetime=self.running_time, towards=towards, price=price)
+                self.acc.make_deal(order)
+                self.on_deal(order)
             else:
                 self.acc.receive_simpledeal(
                     code=code, trade_time=self.running_time, trade_towards=towards, trade_amount=volume, trade_price=price, order_id=order_id, realorder_id=order_id, trade_id=order_id)
@@ -812,7 +901,7 @@ class QAStrategyCtaBase():
             self.update_account()
             return self.accounts.get('available', '')
         elif self.running_mode == 'backtest':
-            return self.acc.cash_available
+            return self.acc.available
 
     def run(self):
 

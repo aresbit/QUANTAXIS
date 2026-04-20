@@ -36,6 +36,12 @@ uv sync --extra research
 uv sync --extra live
 ```
 
+如果你要用恢复回来的 legacy 分析/因子/策略模块：
+
+```bash
+uv sync --extra legacy
+```
+
 ## 2. 常用命令
 
 查看可用命令：
@@ -106,6 +112,67 @@ uv run python -m QUANTAXIS backtest \
 - `--export-equity outputs/000001_equity.csv`
   把净值曲线、信号和仓位序列导出到这个 CSV 文件。
 
+## 3.1 Legacy CTA 基类本地 SQLite 回测
+
+旧 `QAStrategyCtaBase` 现在也可以不依赖 Mongo，直接使用：
+
+- 本地 CSV 数据
+- SQLite 账户快照
+- 原有 `on_bar/send_order/get_positions/plot` 接口
+
+最小样例：
+
+```bash
+uv run python examples/legacy_cta_sqlite_demo.py \
+  --csv data/sample_ohlcv.csv \
+  --sqlite-path outputs/legacy_cta_demo.sqlite3 \
+  --plot outputs/legacy_cta_demo.png
+```
+
+这条命令的含义：
+
+- `examples/legacy_cta_sqlite_demo.py`
+  一个最小旧策略子类示例
+- `--csv`
+  提供本地 OHLCV 数据
+- `--sqlite-path`
+  把账户快照和历史同步到 SQLite
+- `--plot`
+  把 legacy `plot()` 记录下来的时序变量和账户净值输出成 PNG
+
+这条路径适合：
+
+- 你想保留老 `QAStrategy` 的开发习惯
+- 但你不想再依赖 Mongo 做本地回测
+
+这条路径暂时不替代旧实时链路。`eventmq/QAPubSub` 那套实时订阅能力还保留原实现。
+
+## 3.2 Legacy 多标的策略本地 SQLite 回测
+
+旧 `QAStrategyStockBase` 现在也支持本地 SQLite 回测。
+
+最小样例：
+
+```bash
+uv run python examples/legacy_multisymbol_sqlite_demo.py \
+  --csv data/sample_ohlcv.csv \
+  --sqlite-path outputs/legacy_multisymbol_demo.sqlite3 \
+  --plot outputs/legacy_multisymbol_demo.png
+```
+
+这个示例会：
+
+- 基于一份基础 CSV 构造两只股票的本地面板数据
+- 用旧多标的策略基类回测
+- 把账户快照写入 SQLite
+- 把老 `plot()` 指标和净值写成 PNG
+
+适用场景：
+
+- 你要验证老多标的选股或轮动逻辑
+- 你想继续用 `QAStrategyStockBase`
+- 但不想恢复 Mongo 作为本地回测存储
+
 ## 4. 回测输入数据要求
 
 如果你使用 `--csv`，CSV 至少要有这几列：
@@ -155,6 +222,18 @@ datetime,open,high,low,close,volume
 
 - `trades_log`
   每一笔交易的明细
+
+对于 legacy SQLite 账户要注意一件事：
+
+- 旧账户对象在 `settle()` 后会清空当日内存中的 `orders/trades`
+- 所以终端里看到最终 `orders/trades` 很少甚至是 `0` 不代表没成交
+- 真正的历史轨迹在 SQLite 的 `qifi_history` 表里
+
+对于 legacy 图表输出要注意：
+
+- 老策略里继续调用 `self.plot(name, value, format)` 就行
+- 目前 `format` 主要按折线时序来画，适合信号、仓位、价差、状态变量
+- PNG 图默认包含价格、`plot()` 指标、账户权益、回撤四层
 
 ## 6. 图表中文含义
 

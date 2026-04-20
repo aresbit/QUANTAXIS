@@ -1,4 +1,7 @@
 import datetime
+import json
+import os
+import sqlite3
 import traceback
 import uuid
 
@@ -111,6 +114,79 @@ class QIFI_Account():
         self._clickhouse_user = clickhouse_user
         self._clickhouse_password = clickhouse_password
 
+    def _sqlite_connect(self):
+        path = self.trade_host if self.trade_host else "quantaxis_qifi.sqlite3"
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qifi_current (
+                account_cookie TEXT NOT NULL,
+                password TEXT NOT NULL,
+                model TEXT NOT NULL,
+                trading_day TEXT NOT NULL,
+                updatetime TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (account_cookie, password, model)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qifi_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_cookie TEXT NOT NULL,
+                password TEXT NOT NULL,
+                model TEXT NOT NULL,
+                trading_day TEXT NOT NULL,
+                updatetime TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        return conn
+
+    def _json_default(self, value):
+        if isinstance(value, bson.int64.Int64):
+            return int(value)
+        if isinstance(value, (datetime.date, datetime.datetime)):
+            return value.isoformat()
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            return float(value)
+        return str(value)
+
+    def _load_from_snapshot(self, snapshot):
+        self.money = snapshot.get('money', self.money)
+        self.source_id = snapshot.get('sourceid', self.source_id)
+        accpart = snapshot.get('accounts', {})
+        self.pre_balance = accpart.get('pre_balance', self.pre_balance)
+        self.deposit = accpart.get('deposit', self.deposit)
+        self.withdraw = accpart.get('withdraw', self.withdraw)
+        self.withdrawQuota = accpart.get('WithdrawQuota', self.withdrawQuota)
+        self.close_profit = accpart.get('close_profit', self.close_profit)
+        self.static_balance = accpart.get('static_balance', self.static_balance)
+        self.event = snapshot.get('event', self.event)
+        self.trades = snapshot.get('trades', self.trades)
+        self.transfers = snapshot.get('transfers', self.transfers)
+        self.orders = snapshot.get('orders', self.orders)
+        self.taskid = snapshot.get('taskid', self.taskid)
+        self.frozen = snapshot.get('frozen', self.frozen)
+        self.banks = snapshot.get('banks', self.banks)
+        self.status = snapshot.get('status', self.status)
+        self.wsuri = snapshot.get('wsuri', self.wsuri)
+        self._trading_day = snapshot.get('trading_day', self._trading_day)
+        self.positions = {}
+        for position in snapshot.get('positions', {}).values():
+            loaded = QA_Position().loadfrommessage(position)
+            self.positions[position.get('exchange_id') + '.' + position.get('instrument_id')] = loaded
+
     def initial(self):
         if not self.nodatabase:
             if self.dbname in ['ck', 'clickhouse']:
@@ -121,6 +197,9 @@ class QIFI_Account():
                                                         'insert_block_size': 100000000},
                                                     compression=True)
                 self.reload_ck()
+            elif self.dbname == 'sqlite':
+                self.db = self._sqlite_connect()
+                self.reload_sqlite()
 
             else:
 
@@ -139,8 +218,25 @@ class QIFI_Account():
 
         if self.pre_balance == 0 and self.balance == 0 and self.model != "REAL":
             self.log('Create new Account')
-            self.create_simaccount()
+            if self.model == "BACKTEST":
+                self.create_backtestaccount()
+            else:
+                self.create_simaccount()
         self.sync()
+
+    def reload_sqlite(self):
+        row = self.db.execute(
+            """
+            SELECT payload
+            FROM qifi_current
+            WHERE account_cookie = ? AND password = ? AND model = ?
+            """,
+            (self.user_id, self.password, self.model),
+        ).fetchone()
+        if row is None:
+            return
+        snapshot = json.loads(row[0])
+        self._load_from_snapshot(snapshot)
 
 
 
@@ -402,6 +498,36 @@ class QIFI_Account():
             if not self.nodatabase:
                 if self.dbname in ['ck', 'clickhouse']:
                     self.save_ck()
+                elif self.dbname == 'sqlite':
+                    payload = json.dumps(self.message, default=self._json_default)
+                    values = (
+                        self.user_id,
+                        self.password,
+                        self.model,
+                        str(self.trading_day),
+                        self.dtstr,
+                        payload,
+                    )
+                    self.db.execute(
+                        """
+                        INSERT INTO qifi_current(account_cookie, password, model, trading_day, updatetime, payload)
+                        VALUES(?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(account_cookie, password, model)
+                        DO UPDATE SET
+                            trading_day = excluded.trading_day,
+                            updatetime = excluded.updatetime,
+                            payload = excluded.payload
+                        """,
+                        values,
+                    )
+                    self.db.execute(
+                        """
+                        INSERT INTO qifi_history(account_cookie, password, model, trading_day, updatetime, payload)
+                        VALUES(?, ?, ?, ?, ?, ?)
+                        """,
+                        values,
+                    )
+                    self.db.commit()
                 else:
 
                     if self.model == "BACKTEST":
