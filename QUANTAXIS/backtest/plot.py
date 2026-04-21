@@ -46,6 +46,10 @@ def save_backtest_figure(
     axes[1].grid(alpha=0.25)
 
     axes[2].plot(curve["datetime"], curve["equity"], label="equity", color="#2ca02c", linewidth=1.4)
+    if "active_positions" in curve.columns:
+        ax_positions = axes[2].twinx()
+        ax_positions.plot(curve["datetime"], curve["active_positions"], label="active_positions", color="#9467bd", linewidth=1.0, alpha=0.7)
+        ax_positions.set_ylabel("Positions")
     axes[2].set_ylabel("Equity")
     axes[2].grid(alpha=0.25)
 
