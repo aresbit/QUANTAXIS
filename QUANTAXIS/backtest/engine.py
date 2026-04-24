@@ -173,6 +173,9 @@ def run_backtest(
         volume_scores: dict[str, float] = {}
         alpha_scores: dict[str, float] = {}
         alpha_physical_scores: dict[str, float] = {}
+        buy_sell_scores: dict[str, float] = {}
+        pivot_leg_scores: dict[str, float] = {}
+        trade_point_scores: dict[str, float] = {}
         groups: dict[str, str] = {}
         prices: dict[str, float] = {}
         for symbol, row in snapshot.groupby(symbol_column):
@@ -186,6 +189,9 @@ def run_backtest(
             volume_scores[symbol] = float(score.get("volume_score", 0.0))
             alpha_scores[symbol] = float(score.get("alpha_score", 0.0))
             alpha_physical_scores[symbol] = float(score.get("alpha_physical", 0.0))
+            buy_sell_scores[symbol] = float(score.get("buy_sell_score", 0.0))
+            pivot_leg_scores[symbol] = float(score.get("pivot_leg_score", 0.0))
+            trade_point_scores[symbol] = float(score.get("trade_point_score", 0.0))
             groups[symbol] = strategy.config.symbol_groups.get(symbol, "default")
             prices[symbol] = float(row_now["close"])
 
@@ -199,18 +205,28 @@ def run_backtest(
         rank_scores: dict[str, float] = {}
         group_scores: dict[str, float] = {}
         group_active: dict[str, bool] = {}
+        signal_cross_section = _zscore_map(signals)
+        base_cross_section = _zscore_map(base_signals)
+        event_cross_section = _zscore_map(event_signals)
         alpha_cross_section = _zscore_map(alpha_scores)
         alpha_physical_cross = _zscore_map(alpha_physical_scores)
+        buy_sell_cross = _zscore_map(buy_sell_scores)
+        pivot_leg_cross = _zscore_map(pivot_leg_scores)
+        trade_point_cross = _zscore_map(trade_point_scores)
         for group in sorted(set(groups.values())):
             members = [symbol for symbol, member_group in groups.items() if member_group == group]
             group_signals = {symbol: event_signals[symbol] for symbol in members}
             group_zscores = _zscore_map(group_signals)
             group_alpha_zscores = _zscore_map({symbol: alpha_scores[symbol] for symbol in members})
             group_alpha_physical = _zscore_map({symbol: alpha_physical_scores[symbol] for symbol in members})
+            group_buy_sell = _zscore_map({symbol: buy_sell_scores[symbol] for symbol in members})
+            group_pivot_leg = _zscore_map({symbol: pivot_leg_scores[symbol] for symbol in members})
+            group_trade_point = _zscore_map({symbol: trade_point_scores[symbol] for symbol in members})
             event_mean = float(pd.Series(group_signals, dtype=float).clip(lower=0.0).mean()) if group_signals else 0.0
             base_mean = float(pd.Series({symbol: base_signals[symbol] for symbol in members}, dtype=float).mean()) if members else 0.0
             alpha_mean = float(pd.Series({symbol: alpha_scores[symbol] for symbol in members}, dtype=float).clip(lower=0.0).mean()) if members else 0.0
-            group_score = event_mean * 0.55 + max(base_mean, 0.0) * 0.20 + alpha_mean * 0.35
+            structure_mean = float(pd.Series({symbol: buy_sell_scores[symbol] + pivot_leg_scores[symbol] + trade_point_scores[symbol] for symbol in members}, dtype=float).clip(lower=0.0).mean()) if members else 0.0
+            group_score = event_mean * 0.45 + max(base_mean, 0.0) * 0.18 + alpha_mean * 0.27 + structure_mean * 0.25
             group_scores[group] = group_score
             group_active[group] = regime_on and group_score >= strategy.config.group_activation_threshold
             for symbol in members:
@@ -221,11 +237,23 @@ def run_backtest(
                     + alpha_cross_section.get(symbol, 0.0) * 0.15
                     + alpha_physical_cross.get(symbol, 0.0) * 0.10
                 )
+                structure_cross = (
+                    group_buy_sell.get(symbol, 0.0) * 0.08
+                    + group_pivot_leg.get(symbol, 0.0) * 0.06
+                    + group_trade_point.get(symbol, 0.0) * 0.08
+                    + buy_sell_cross.get(symbol, 0.0) * 0.06
+                    + pivot_leg_cross.get(symbol, 0.0) * 0.04
+                    + trade_point_cross.get(symbol, 0.0) * 0.06
+                )
                 rank_scores[symbol] = (
-                    group_zscores.get(symbol, 0.0) * 0.35
-                    + base_signals[symbol] * 0.15
-                    + event_intensity * 0.20
+                    signal_cross_section.get(symbol, 0.0) * 0.40
+                    + event_cross_section.get(symbol, 0.0) * 0.30
+                    + base_cross_section.get(symbol, 0.0) * 0.15
+                    + group_zscores.get(symbol, 0.0) * 0.15
+                    + base_signals[symbol] * 0.10
+                    + event_intensity * 0.15
                     + alpha_cross
+                    + structure_cross
                 )
 
         ranked = sorted(rank_scores.items(), key=lambda item: item[1], reverse=True)
@@ -262,13 +290,14 @@ def run_backtest(
         long_candidates = selected
         long_weights_raw = _softmax([signal - strategy.config.buy_threshold for _, signal in long_candidates], strategy.config.rank_temperature)
         raw_target_weights = {}
-        for (symbol, _), weight in zip(long_candidates, long_weights_raw):
+        for (symbol, rank_score), weight in zip(long_candidates, long_weights_raw):
             if shares[symbol] > 0 and not regime_on:
                 raw_target_weights[symbol] = min(weight, strategy.config.min_target_weight)
                 continue
             event_strength = max(event_signals[symbol], 0.0) + max(regime_score, 0.0) * 0.25
             group_strength = max(group_scores.get(groups[symbol], 0.0), 0.0)
-            scaled_weight = weight * min(1.0, event_strength + group_strength)
+            signal_scale = strategy.config.min_signal_target_scale if rank_score > strategy.config.buy_threshold else 0.0
+            scaled_weight = weight * min(1.0, max(event_strength + group_strength, signal_scale))
             raw_target_weights[symbol] = max(scaled_weight, 0.0)
         target_weights = _cap_and_normalize(
             raw_target_weights,

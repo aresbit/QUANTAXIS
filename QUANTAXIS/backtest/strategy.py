@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import time
 
 import numpy as np
@@ -36,6 +36,7 @@ class StrategyConfig:
     market_regime_score_threshold: float = 0.45
     group_activation_threshold: float = 0.02
     min_target_weight: float = 0.06
+    min_signal_target_scale: float = 0.45
     exit_on_regime_off: bool = True
     morning_confirm_bars: int = 2
     afternoon_confirm_bars: int = 2
@@ -69,8 +70,27 @@ class RecursiveQTransformerStrategy:
         "trend_gap",
         "top_fractal",
         "bottom_fractal",
+        "fractal_type",
+        "fractal_density",
         "chan_bias",
+        "stroke_direction",
         "stroke_strength",
+        "segment_direction",
+        "segment_strength",
+        "pivot_active",
+        "pivot_width",
+        "pivot_leg_phase",
+        "pivot_leg_direction",
+        "pivot_leg_strength",
+        "buy_point_1",
+        "buy_point_2",
+        "buy_point_3",
+        "sell_point_1",
+        "sell_point_2",
+        "sell_point_3",
+        "buy_divergence_score",
+        "sell_divergence_score",
+        "trade_point_score",
         "volatility",
         "fft_high_band_ratio",
         "fft_peak_frequency",
@@ -95,6 +115,10 @@ class RecursiveQTransformerStrategy:
         self._hidden = np.zeros(self.config.hidden_dim, dtype=float)
         self._projection = self._build_projection(len(self.FEATURE_COLUMNS), self.config.hidden_dim)
         self._readout = np.linspace(-0.35, 0.35, self.config.hidden_dim)
+        self._feature_index = {name: idx for idx, name in enumerate(self.FEATURE_COLUMNS)}
+
+    def clone(self) -> "RecursiveQTransformerStrategy":
+        return type(self)(config=replace(self.config))
 
     @staticmethod
     def _build_projection(feature_dim: int, hidden_dim: int) -> np.ndarray:
@@ -105,8 +129,14 @@ class RecursiveQTransformerStrategy:
         self._hidden.fill(0.0)
 
     def _attention_weights(self, seq: np.ndarray) -> np.ndarray:
-        momentum = seq[:, 0] + 0.7 * seq[:, 5] + 0.5 * seq[:, 8]
-        momentum = momentum + 0.8 * seq[:, 14] + 0.4 * seq[:, 15]
+        idx = self._feature_index
+        momentum = (
+            seq[:, idx["return_1"]]
+            + 0.7 * seq[:, idx["trend_gap"]]
+            + 0.5 * seq[:, idx["fractal_type"]]
+            + 0.3 * seq[:, idx["trade_point_score"]]
+        )
+        momentum = momentum + 0.8 * seq[:, idx["fft_burst"]] + 0.4 * seq[:, idx["fft_regime_shift"]]
         scaled = np.clip(momentum * self.config.attention_temperature, -20.0, 20.0)
         exp_scores = np.exp(scaled - scaled.max())
         weights = exp_scores / exp_scores.sum()
@@ -116,6 +146,9 @@ class RecursiveQTransformerStrategy:
         proposal = np.tanh(context @ self._projection)
         self._hidden = self.config.state_decay * self._hidden + (1.0 - self.config.state_decay) * proposal
         return self._hidden
+
+    def _f(self, context: np.ndarray, name: str) -> float:
+        return float(context[self._feature_index[name]])
 
     @staticmethod
     def _empty_score() -> dict[str, float | str]:
@@ -131,6 +164,9 @@ class RecursiveQTransformerStrategy:
             "momentum_score": 0.0,
             "structure_score": 0.0,
             "fractal_score": 0.0,
+            "buy_sell_score": 0.0,
+            "pivot_leg_score": 0.0,
+            "trade_point_score": 0.0,
             "fft_score": 0.0,
             "alpha_score": 0.0,
             "alpha_physical": 0.0,
@@ -157,13 +193,57 @@ class RecursiveQTransformerStrategy:
             latest = feature_frame.iloc[idx]
             prev = feature_frame.iloc[idx - 1] if idx >= 1 else latest
 
-            momentum_score = context[0] * 0.42 + context[1] * 0.28 + context[2] * 0.12 + context[5] * 0.30 + context[19] * 0.12
-            structure_score = context[8] * 0.16 + context[9] * 0.11
-            fractal_score = (context[7] - context[6]) * 0.26
-            fft_score = context[14] * 0.22 + context[11] * 0.10 - context[13] * 0.08 + context[15] * 0.16
-            alpha_score = context[20] * 0.12 + context[21] * 0.10 + context[22] * 0.24 + context[23] * 0.08 + context[24] * 0.10 + context[25] * 0.10 + context[26] * 0.30
+            momentum_score = (
+                self._f(context, "return_1") * 0.42
+                + self._f(context, "return_5") * 0.28
+                + self._f(context, "return_10") * 0.12
+                + self._f(context, "trend_gap") * 0.30
+                + self._f(context, "session_momentum") * 0.12
+            )
+            structure_score = (
+                self._f(context, "chan_bias") * 0.16
+                + self._f(context, "stroke_direction") * 0.09
+                + self._f(context, "stroke_strength") * 0.08
+                + self._f(context, "segment_direction") * 0.15
+                + self._f(context, "segment_strength") * 0.08
+                + self._f(context, "pivot_active") * 0.05
+                - self._f(context, "pivot_width") * 0.08
+            )
+            fractal_score = (
+                (self._f(context, "bottom_fractal") - self._f(context, "top_fractal")) * 0.18
+                + self._f(context, "fractal_type") * 0.12
+                + self._f(context, "fractal_density") * 0.03
+            )
+            pivot_leg_score = (
+                self._f(context, "pivot_leg_phase") * 0.16
+                + self._f(context, "pivot_leg_direction") * 0.10
+                + self._f(context, "pivot_leg_strength") * 0.18
+            )
+            trade_point_score = self._f(context, "trade_point_score")
+            buy_sell_score = (
+                (self._f(context, "buy_point_1") - self._f(context, "sell_point_1")) * 0.20
+                + (self._f(context, "buy_point_2") - self._f(context, "sell_point_2")) * 0.35
+                + (self._f(context, "buy_point_3") - self._f(context, "sell_point_3")) * 0.45
+                + (self._f(context, "buy_divergence_score") - self._f(context, "sell_divergence_score")) * 0.45
+                + trade_point_score * 0.25
+            )
+            fft_score = (
+                self._f(context, "fft_burst") * 0.22
+                + self._f(context, "fft_high_band_ratio") * 0.10
+                - self._f(context, "fft_spectral_entropy") * 0.08
+                + self._f(context, "fft_regime_shift") * 0.16
+            )
+            alpha_score = (
+                self._f(context, "alpha101_05") * 0.12
+                + self._f(context, "alpha101_11") * 0.10
+                + self._f(context, "alpha101_25") * 0.24
+                + self._f(context, "alpha101_41") * 0.08
+                + self._f(context, "alpha101_42") * 0.10
+                + self._f(context, "alpha101_101") * 0.10
+                + self._f(context, "alpha101_physical") * 0.30
+            )
             hidden_score = float(np.tanh(hidden @ self._readout))
-            risk_penalty = max(context[10], 0.0) * 0.28 + max(context[4], 0.0) * 0.04
+            risk_penalty = max(self._f(context, "volatility"), 0.0) * 0.28 + max(self._f(context, "volume_z"), 0.0) * 0.04
             current_time = pd.Timestamp(latest["datetime"]).time() if "datetime" in latest else time(9, 50)
             is_morning = current_time <= time(10, 50)
             session_label = "morning" if is_morning else "afternoon"
@@ -172,6 +252,12 @@ class RecursiveQTransformerStrategy:
             fractal_impulse = float(latest["bottom_fractal"] - latest["top_fractal"])
             chan_impulse = float(latest["chan_bias"] - prev["chan_bias"])
             stroke_impulse = float(latest["stroke_strength"])
+            segment_impulse = float(latest["segment_direction"] * latest["segment_strength"])
+            pivot_bias = float(latest["pivot_active"] * np.tanh(latest["pivot_width"] * 50.0))
+            buy_sell_impulse = float(
+                latest["buy_point_1"] + latest["buy_point_2"] + latest["buy_point_3"]
+                - latest["sell_point_1"] - latest["sell_point_2"] - latest["sell_point_3"]
+            )
             vwap_gap = float(latest["intraday_vwap_gap"])
             opening_break = float(latest["opening_range_break"])
             opening_distance = float(latest["opening_range_distance"])
@@ -188,6 +274,9 @@ class RecursiveQTransformerStrategy:
                     fractal_impulse * 0.75
                     + chan_impulse * 0.25
                     + np.tanh(stroke_impulse) * 0.15
+                    + np.tanh(segment_impulse) * 0.20
+                    - pivot_bias * 0.10
+                    + buy_sell_impulse * 0.20
                     + opening_break * 0.8
                     + np.tanh(opening_distance * 20.0) * 0.35
                     + np.tanh(alpha_body * 2.5) * 0.30
@@ -199,6 +288,9 @@ class RecursiveQTransformerStrategy:
                     fractal_impulse * 0.55
                     + chan_impulse * 0.20
                     + np.tanh(stroke_impulse) * 0.15
+                    + np.tanh(segment_impulse) * 0.20
+                    - pivot_bias * 0.10
+                    + buy_sell_impulse * 0.18
                     + np.tanh(vwap_gap * 30.0) * 0.55
                     + np.tanh(session_momentum * 12.0) * 0.25
                     + np.tanh(alpha_reversal * 5.0) * 0.25
@@ -214,6 +306,8 @@ class RecursiveQTransformerStrategy:
                     momentum_score
                     + structure_score
                     + fractal_score
+                    + pivot_leg_score * 0.45
+                    + buy_sell_score * 0.35
                     + fft_score
                     + alpha_score
                     + hidden_score
@@ -235,6 +329,9 @@ class RecursiveQTransformerStrategy:
                     "momentum_score": float(momentum_score),
                     "structure_score": float(structure_score),
                     "fractal_score": float(fractal_score),
+                    "pivot_leg_score": float(pivot_leg_score),
+                    "buy_sell_score": float(buy_sell_score),
+                    "trade_point_score": float(trade_point_score),
                     "fft_score": float(fft_score),
                     "alpha_score": float(alpha_score),
                     "alpha_physical": float(alpha_physical),

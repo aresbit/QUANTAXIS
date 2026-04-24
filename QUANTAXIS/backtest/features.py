@@ -1,7 +1,45 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
+
+
+@dataclass(frozen=True, slots=True)
+class ChanFractal:
+    index: int
+    kind: int
+    price: float
+
+
+@dataclass(frozen=True, slots=True)
+class ChanStroke:
+    start: int
+    end: int
+    direction: int
+    high: float
+    low: float
+    strength: float
+
+
+@dataclass(frozen=True, slots=True)
+class ChanSegment:
+    start: int
+    end: int
+    direction: int
+    high: float
+    low: float
+    strength: float
+
+
+@dataclass(frozen=True, slots=True)
+class ChanPivot:
+    start: int
+    end: int
+    high: float
+    low: float
+    width: float
 
 
 def rolling_zscore(series: pd.Series, window: int) -> pd.Series:
@@ -64,6 +102,151 @@ def rolling_percentile(series: pd.Series, window: int) -> pd.Series:
     ).fillna(0.5)
 
 
+def _chan_object_projection(frame: pd.DataFrame, fractal_window: int) -> pd.DataFrame:
+    high = frame["high"].astype(float).to_numpy()
+    low = frame["low"].astype(float).to_numpy()
+    close = frame["close"].astype(float).to_numpy()
+    top = frame["top_fractal"].astype(float).to_numpy()
+    bottom = frame["bottom_fractal"].astype(float).to_numpy()
+    n = len(frame)
+    min_gap = max(2, fractal_window // 2)
+
+    fractals: list[ChanFractal] = []
+    for idx in range(n):
+        if bottom[idx] > 0:
+            fractals.append(ChanFractal(idx, 1, float(low[idx])))
+        if top[idx] > 0:
+            fractals.append(ChanFractal(idx, -1, float(high[idx])))
+
+    confirmed: list[ChanFractal] = []
+    for fractal in fractals:
+        if not confirmed:
+            confirmed.append(fractal)
+            continue
+        last = confirmed[-1]
+        if fractal.kind == last.kind:
+            more_extreme = (fractal.kind == 1 and fractal.price < last.price) or (fractal.kind == -1 and fractal.price > last.price)
+            if more_extreme:
+                confirmed[-1] = fractal
+            continue
+        if fractal.index - last.index < min_gap:
+            continue
+        confirmed.append(fractal)
+
+    strokes: list[ChanStroke] = []
+    for left, right in zip(confirmed, confirmed[1:]):
+        direction = 1 if left.kind == 1 and right.kind == -1 else -1
+        start, end = sorted((left.index, right.index))
+        span_high = float(np.max(high[start : end + 1]))
+        span_low = float(np.min(low[start : end + 1]))
+        base = max(abs(close[start]), 1e-9)
+        strength = abs(right.price - left.price) / base
+        strokes.append(ChanStroke(start, end, direction, span_high, span_low, float(strength)))
+
+    segments: list[ChanSegment] = []
+    for idx in range(2, len(strokes)):
+        window = strokes[idx - 2 : idx + 1]
+        direction = window[-1].direction
+        start = window[0].start
+        end = window[-1].end
+        span_high = max(item.high for item in window)
+        span_low = min(item.low for item in window)
+        strength = sum(item.strength for item in window) / 3.0
+        segments.append(ChanSegment(start, end, direction, span_high, span_low, float(strength)))
+
+    pivots: list[ChanPivot] = []
+    for idx in range(2, len(strokes)):
+        window = strokes[idx - 2 : idx + 1]
+        overlap_high = min(item.high for item in window)
+        overlap_low = max(item.low for item in window)
+        if overlap_high <= overlap_low:
+            continue
+        width = (overlap_high - overlap_low) / max(close[window[-1].end], 1e-9)
+        pivots.append(ChanPivot(window[0].start, window[-1].end, float(overlap_high), float(overlap_low), float(width)))
+
+    out = pd.DataFrame(index=frame.index)
+    for column in [
+        "fractal_type",
+        "fractal_density",
+        "stroke_direction",
+        "segment_direction",
+        "segment_strength",
+        "pivot_active",
+        "pivot_width",
+        "pivot_leg_phase",
+        "pivot_leg_direction",
+        "pivot_leg_strength",
+        "buy_point_1",
+        "buy_point_2",
+        "buy_point_3",
+        "sell_point_1",
+        "sell_point_2",
+        "sell_point_3",
+        "buy_divergence_score",
+        "sell_divergence_score",
+        "trade_point_score",
+    ]:
+        out[column] = 0.0
+
+    for fractal in confirmed:
+        out.iat[fractal.index, out.columns.get_loc("fractal_type")] = float(fractal.kind)
+    out["fractal_density"] = (frame["top_fractal"] + frame["bottom_fractal"]).rolling(fractal_window * 2, min_periods=1).sum()
+
+    for stroke in strokes:
+        out.loc[frame.index[stroke.start : stroke.end + 1], "stroke_direction"] = stroke.direction
+        out.loc[frame.index[stroke.end], "pivot_leg_direction"] = stroke.direction
+        out.loc[frame.index[stroke.end], "pivot_leg_strength"] = stroke.strength
+
+    for segment in segments:
+        out.loc[frame.index[segment.start : segment.end + 1], "segment_direction"] = segment.direction
+        out.loc[frame.index[segment.start : segment.end + 1], "segment_strength"] = segment.strength
+
+    for pivot in pivots:
+        out.loc[frame.index[pivot.start : pivot.end + 1], "pivot_active"] = 1.0
+        out.loc[frame.index[pivot.start : pivot.end + 1], "pivot_width"] = pivot.width
+
+    prev_same_dir_strength: dict[int, float] = {1: 0.0, -1: 0.0}
+    for stroke in strokes:
+        idx = stroke.end
+        previous_pivots = [pivot for pivot in pivots if pivot.end < idx]
+        if not previous_pivots:
+            continue
+        last_pivot = previous_pivots[-1]
+        phase = 1.0 if stroke.direction > 0 else -1.0
+        out.loc[frame.index[idx], "pivot_leg_phase"] = phase
+        prev_strength = prev_same_dir_strength.get(stroke.direction, 0.0)
+        divergence = max(prev_strength - stroke.strength, 0.0) / max(prev_strength, 1e-9) if prev_strength > 0 else 0.0
+        prev_same_dir_strength[stroke.direction] = stroke.strength
+        if stroke.direction > 0:
+            if stroke.high > last_pivot.high:
+                out.loc[frame.index[idx], "buy_point_1"] = 1.0
+                out.loc[frame.index[idx], "buy_divergence_score"] = divergence
+            if low[idx] <= last_pivot.high and close[idx] > last_pivot.high:
+                out.loc[frame.index[idx], "buy_point_2"] = 1.0
+            if low[idx] > last_pivot.high and stroke.strength > 0:
+                out.loc[frame.index[idx], "buy_point_3"] = 1.0
+        else:
+            if stroke.low < last_pivot.low:
+                out.loc[frame.index[idx], "sell_point_1"] = 1.0
+                out.loc[frame.index[idx], "sell_divergence_score"] = divergence
+            if high[idx] >= last_pivot.low and close[idx] < last_pivot.low:
+                out.loc[frame.index[idx], "sell_point_2"] = 1.0
+            if high[idx] < last_pivot.low and stroke.strength > 0:
+                out.loc[frame.index[idx], "sell_point_3"] = 1.0
+
+    out["trade_point_score"] = (
+        out["buy_point_1"] * 0.35
+        + out["buy_point_2"] * 0.55
+        + out["buy_point_3"] * 0.65
+        - out["sell_point_1"] * 0.35
+        - out["sell_point_2"] * 0.55
+        - out["sell_point_3"] * 0.65
+        + out["buy_divergence_score"] * 0.45
+        - out["sell_divergence_score"] * 0.45
+    )
+    return out.fillna(0.0)
+
+
 def chan_feature_frame(data: pd.DataFrame, fractal_window: int = 5) -> pd.DataFrame:
     frame = data.copy()
     if "datetime" in frame.columns:
@@ -90,6 +273,9 @@ def chan_feature_frame(data: pd.DataFrame, fractal_window: int = 5) -> pd.DataFr
         - frame["top_fractal"].rolling(fractal_window, min_periods=1).sum()
     )
     frame["stroke_strength"] = rolling_zscore(close.diff().abs().rolling(3, min_periods=1).sum(), 20)
+    chan_projection = _chan_object_projection(frame, fractal_window=fractal_window)
+    for column in chan_projection.columns:
+        frame[column] = chan_projection[column]
     frame["volatility"] = close.pct_change().rolling(20, min_periods=5).std().fillna(0.0)
     fft_window = max(16, fractal_window * 4)
     returns = close.pct_change().fillna(0.0)
