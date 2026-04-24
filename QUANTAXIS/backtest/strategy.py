@@ -249,24 +249,13 @@ class RecursiveQTransformerStrategy:
                 + self._f(context, "fft_regime_shift") * 0.16
             )
             alpha_score = (
-                self._f(context, "alpha101_05") * 0.08
-                + self._f(context, "alpha101_11") * 0.06
-                + self._f(context, "alpha101_25") * 0.14
-                + self._f(context, "alpha101_41") * 0.05
-                + self._f(context, "alpha101_42") * 0.06
-                + self._f(context, "alpha101_101") * 0.06
-                + self._f(context, "alpha101_04") * 0.04
-                + self._f(context, "alpha101_07") * 0.05
-                + self._f(context, "alpha101_12") * 0.04
-                + self._f(context, "alpha101_20") * 0.05
-                + self._f(context, "alpha101_28") * 0.03
-                + self._f(context, "alpha101_51") * 0.03
-                + self._f(context, "alpha101_54") * 0.04
-                + self._f(context, "alpha101_60") * 0.04
-                + self._f(context, "vol_rank_20") * 0.03
-                + self._f(context, "gap_open") * 0.04
-                + self._f(context, "gap_high") * 0.04
-                + self._f(context, "alpha101_physical") * 0.16
+                self._f(context, "alpha101_05") * 0.12
+                + self._f(context, "alpha101_11") * 0.10
+                + self._f(context, "alpha101_25") * 0.24
+                + self._f(context, "alpha101_41") * 0.08
+                + self._f(context, "alpha101_42") * 0.10
+                + self._f(context, "alpha101_101") * 0.10
+                + self._f(context, "alpha101_physical") * 0.30
             )
             hidden_score = float(np.tanh(hidden @ self._readout))
             risk_penalty = max(self._f(context, "volatility"), 0.0) * 0.28 + max(self._f(context, "volume_z"), 0.0) * 0.04

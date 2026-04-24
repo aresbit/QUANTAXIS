@@ -146,7 +146,7 @@ def _compute_market_regime(
 class ImpactConfig:
     """Market impact parameters."""
 
-    model: str = "square_root"  # "square_root", "linear", "almgren_chriss", "none"
+    model: str = "none"  # "square_root", "linear", "almgren_chriss", "none"
     permanent_impact: float = 0.0001  # permanent impact coefficient
     temporary_impact: float = 0.0002  # temporary impact coefficient
     # Empirical square-root impact: I = impact_coeff * sigma * sqrt(Q/V)
@@ -399,19 +399,26 @@ def run_backtest(
                 break
         long_candidates = selected
         # ── Portfolio Optimization ──────────────────────────────────────
-        # Build return history from score frames for optimizer
+        # Keep the historical softmax allocator as the default. Portfolio
+        # optimizers are opt-in because signal deltas are not price returns and
+        # can over-allocate risk if treated as an asset return history.
         opt_returns: dict[str, pd.Series] = {}
-        for symbol in list(dict(long_candidates).keys()):
-            sf = score_frames[symbol]
-            if "signal" in sf.columns and len(sf) > 5:
-                opt_returns[symbol] = sf["signal"].iloc[-min(252, len(sf)):].diff().fillna(0.0)
+        if portfolio_config is not None:
+            for symbol in list(dict(long_candidates).keys()):
+                idx = symbol_indices.get(symbol, -1)
+                if idx >= 5:
+                    history = symbol_frames[symbol]["close"].astype(float).iloc[max(0, idx - 251) : idx + 1]
+                    opt_returns[symbol] = history.pct_change().fillna(0.0).reset_index(drop=True)
 
-        if opt_returns and len(opt_returns) >= 2:
+        if portfolio_config is not None and opt_returns and len(opt_returns) >= 2:
             opt_returns_df = pd.DataFrame(opt_returns)
-            opt_cfg = portfolio_config or PortfolioConfig(
-                max_weight=strategy.config.max_position_weight,
-                gross_exposure=strategy.config.gross_exposure if regime_on else min(strategy.config.gross_exposure, 0.2),
-                method="mvo",
+            opt_cfg = replace(
+                portfolio_config,
+                max_weight=min(portfolio_config.max_weight, strategy.config.max_position_weight),
+                gross_exposure=min(
+                    portfolio_config.gross_exposure,
+                    strategy.config.gross_exposure if regime_on else min(strategy.config.gross_exposure, 0.2),
+                ),
             )
             # Use signal scores as views for Black-Litterman
             opt_views = {
