@@ -18,12 +18,20 @@ class AccountSnapshot:
     cash: float
     positions: dict[str, Position] = field(default_factory=dict)
 
-    @property
-    def equity(self) -> float:
-        return round(self.cash + sum(pos.quantity * pos.avg_price for pos in self.positions.values()), 2)
+    def equity(self, last_prices: dict[str, float] | None = None) -> float:
+        if last_prices is None:
+            return round(self.cash + sum(pos.quantity * pos.avg_price for pos in self.positions.values()), 2)
+        return round(
+            self.cash
+            + sum(
+                pos.quantity * last_prices.get(symbol, pos.avg_price)
+                for symbol, pos in self.positions.items()
+            ),
+            2,
+        )
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self, last_prices: dict[str, float] | None = None) -> dict[str, object]:
         payload = asdict(self)
         payload["positions"] = {symbol: asdict(position) for symbol, position in self.positions.items()}
-        payload["equity"] = self.equity
+        payload["equity"] = self.equity(last_prices)
         return payload

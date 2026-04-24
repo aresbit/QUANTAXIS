@@ -94,6 +94,43 @@ def _fft_spectral_entropy(values: np.ndarray) -> float:
     return float(entropy / np.log(probs.size))
 
 
+def _batch_fft_features(values: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized rolling FFT features using sliding windows."""
+    n = len(values)
+    if n < window:
+        return np.zeros(n), np.zeros(n), np.zeros(n)
+
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    windows = sliding_window_view(values, window)
+    means = windows.mean(axis=1, keepdims=True)
+    centered = windows - means
+    spectra = np.abs(np.fft.rfft(centered, axis=1)) ** 2
+    spectra = spectra[:, 1:]
+    totals = spectra.sum(axis=1)
+    valid = totals > 0
+
+    split = max(1, int(np.ceil(spectra.shape[1] * 0.6)))
+    high_band = spectra[:, split:].sum(axis=1)
+    ratios = np.zeros_like(high_band)
+    ratios[valid] = high_band[valid] / totals[valid]
+
+    peaks = np.argmax(spectra, axis=1)
+    peak_freqs = (peaks + 1) / max(spectra.shape[1], 1)
+
+    probs = np.clip(spectra / totals[:, None], 1e-12, None)
+    entropies = -np.sum(probs * np.log(probs), axis=1)
+    max_entropy = np.log(spectra.shape[1])
+    normalized_entropy = entropies / max_entropy
+
+    pad = np.zeros(window - 1)
+    return (
+        np.concatenate([pad, ratios]),
+        np.concatenate([pad, peak_freqs]),
+        np.concatenate([pad, normalized_entropy]),
+    )
+
+
 def rolling_percentile(series: pd.Series, window: int) -> pd.Series:
     min_periods = max(5, window // 4)
     return series.rolling(window, min_periods=min_periods).apply(
@@ -279,9 +316,10 @@ def chan_feature_frame(data: pd.DataFrame, fractal_window: int = 5) -> pd.DataFr
     frame["volatility"] = close.pct_change().rolling(20, min_periods=5).std().fillna(0.0)
     fft_window = max(16, fractal_window * 4)
     returns = close.pct_change().fillna(0.0)
-    frame["fft_high_band_ratio"] = returns.rolling(fft_window, min_periods=8).apply(_fft_high_band_ratio, raw=True).fillna(0.0)
-    frame["fft_peak_frequency"] = returns.rolling(fft_window, min_periods=8).apply(_fft_peak_frequency, raw=True).fillna(0.0)
-    frame["fft_spectral_entropy"] = returns.rolling(fft_window, min_periods=8).apply(_fft_spectral_entropy, raw=True).fillna(0.0)
+    fft_hbr, fft_pf, fft_se = _batch_fft_features(returns.to_numpy(dtype=float), fft_window)
+    frame["fft_high_band_ratio"] = pd.Series(fft_hbr, index=frame.index)
+    frame["fft_peak_frequency"] = pd.Series(fft_pf, index=frame.index)
+    frame["fft_spectral_entropy"] = pd.Series(fft_se, index=frame.index)
     frame["fft_burst"] = rolling_zscore(frame["fft_high_band_ratio"] * (1.0 + frame["range_ratio"]), 20)
     frame["fft_regime_shift"] = rolling_zscore(
         frame["fft_peak_frequency"].diff().abs() + frame["fft_spectral_entropy"].diff().abs(),
@@ -340,12 +378,75 @@ def chan_feature_frame(data: pd.DataFrame, fractal_window: int = 5) -> pd.DataFr
     frame["alpha101_42"] = ((frame["vwap"] - close) / alpha42_denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     frame["alpha101_101"] = ((close - open) / (price_span + 1e-3)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # ── Additional Alpha Factors ──────────────────────────────────────────
+    # Alpha#4: (-1 * correlation(rank(open), rank(volume), 10))
+    frame["alpha101_04"] = -rolling_percentile(
+        open.rolling(10).corr(volume.rolling(10).rank()), 20
+    ).fillna(0.0)
+
+    # Alpha#7: max(high - open, close - low)^rank / volume zscore
+    max_move = pd.concat([high - open, close - low], axis=1).max(axis=1)
+    frame["alpha101_07"] = rolling_zscore(max_move * rolling_percentile(volume, 20), 20).fillna(0.0)
+
+    # Alpha#12: log(volume / adv20) * sign(close - open)
+    frame["alpha101_12"] = (
+        np.sign(close - open).replace(0, 1)
+        * np.log(volume / frame["adv20"].replace(0, np.nan)).fillna(0)
+    ).fillna(0.0)
+
+    # Alpha#20: (close - open + high - low) / (high - low + 1e-3)
+    body = (close - open).abs()
+    shadow = (high - low)
+    frame["alpha101_20"] = rolling_zscore(
+        (close - open) / (shadow + 1e-3) + (high - low) / (shadow + 1e-3), 20
+    ).fillna(0.0)
+
+    # Alpha#28: (close - rolling_min(low, 9)) / (rolling_max(high, 9) - rolling_min(low, 9)) * 100
+    min_low_9 = low.rolling(9, min_periods=3).min()
+    max_high_9 = high.rolling(9, min_periods=3).max()
+    frame["alpha101_28"] = (
+        (close - min_low_9) / (max_high_9 - min_low_9 + 1e-3) * 100
+    ).fillna(50.0)
+
+    # Alpha#51: (high - low) / (sum(close, 10) / 10) * 100
+    frame["alpha101_51"] = (
+        (high - low) / (close.rolling(10, min_periods=3).mean() + 1e-3) * 100
+    ).fillna(0.0)
+
+    # Alpha#54: (close - open) * volume / adv20
+    frame["alpha101_54"] = (
+        (close - open) * volume / frame["adv20"].replace(0, np.nan)
+    ).replace([np.inf, -np.inf], 0).fillna(0.0)
+
+    # Alpha#60: (close - open) * sqrt(volume / adv20)
+    frame["alpha101_60"] = (
+        (close - open) * np.sqrt(volume / frame["adv20"].replace(0, np.nan)).fillna(0)
+    ).fillna(0.0)
+
+    # Rolling volatility regime
+    frame["vol_rank_20"] = rolling_percentile(
+        close.pct_change().rolling(20, min_periods=5).std(), 60
+    )
+
+    # Gap features
+    frame["gap_open"] = (open / close.shift(1) - 1.0).fillna(0.0)
+    frame["gap_high"] = (high / close.shift(1) - 1.0).fillna(0.0)
+
+    # Combined alpha physical factor (enhanced)
     frame["alpha101_physical"] = (
-        frame["alpha101_05"] * 0.18
-        + frame["alpha101_11"] * 0.16
-        + frame["alpha101_25"] * 0.24
-        + rolling_zscore(frame["alpha101_41"], 20) * 0.10
-        + rolling_zscore(frame["alpha101_42"], 20) * 0.12
-        + rolling_zscore(frame["alpha101_101"], 20) * 0.20
+        frame["alpha101_05"] * 0.12
+        + frame["alpha101_11"] * 0.10
+        + frame["alpha101_25"] * 0.18
+        + frame["alpha101_04"] * 0.06
+        + frame["alpha101_07"] * 0.08
+        + frame["alpha101_12"] * 0.06
+        + frame["alpha101_20"] * 0.08
+        + frame["alpha101_28"] * 0.04
+        + frame["alpha101_51"] * 0.04
+        + frame["alpha101_54"] * 0.06
+        + frame["alpha101_60"] * 0.06
+        + rolling_zscore(frame["alpha101_41"], 20) * 0.06
+        + rolling_zscore(frame["alpha101_42"], 20) * 0.06
     ).fillna(0.0)
     return frame.fillna(0.0)

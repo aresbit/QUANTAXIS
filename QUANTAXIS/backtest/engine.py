@@ -1,25 +1,39 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
+from QUANTAXIS.backtest.market_rules import (
+    MarketContext,
+    build_market_contexts,
+    can_trade,
+    infer_market_segment,
+)
+from QUANTAXIS.backtest.portfolio import PortfolioConfig, compute_portfolio_risk, optimize_portfolio
+from QUANTAXIS.backtest.risk import RiskChecker, RiskConfig, generate_risk_report
 from QUANTAXIS.backtest.strategy import RecursiveQTransformerStrategy
+
+logger = logging.getLogger("quantaxis.backtest")
 
 
 @dataclass(slots=True)
 class BacktestResult:
     bars: int
     trades: int
+    rejected: int
     final_equity: float
     total_return: float
     annual_return: float
     max_drawdown: float
     sharpe: float
+    calmar: float
     equity_curve: list[dict[str, float | str]]
     trades_log: list[dict[str, float | str]]
+    rejected_log: list[dict[str, float | str]]
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -47,6 +61,12 @@ def _sharpe(returns: pd.Series, bars_per_year: int) -> float:
     if clean.empty or clean.std() == 0:
         return 0.0
     return float((clean.mean() / clean.std()) * (bars_per_year ** 0.5))
+
+
+def _calmar(annual_return: float, max_drawdown: float) -> float:
+    if max_drawdown >= 0 or max_drawdown == 0:
+        return 0.0
+    return float(annual_return / abs(max_drawdown))
 
 
 def _softmax(values: list[float], temperature: float) -> list[float]:
@@ -120,14 +140,86 @@ def _compute_market_regime(
     return regime_on, float(regime_score)
 
 
+# ── Market Impact Models ─────────────────────────────────────────────────────
+
+@dataclass(slots=True)
+class ImpactConfig:
+    """Market impact parameters."""
+
+    model: str = "square_root"  # "square_root", "linear", "almgren_chriss", "none"
+    permanent_impact: float = 0.0001  # permanent impact coefficient
+    temporary_impact: float = 0.0002  # temporary impact coefficient
+    # Empirical square-root impact: I = impact_coeff * sigma * sqrt(Q/V)
+    impact_coefficient: float = 0.1
+    # Almgren-Chriss parameters
+    ac_eta: float = 0.1
+    ac_gamma: float = 0.05
+    # Minimum participation rate for viability check
+    max_participation: float = 0.15
+
+
+def estimate_market_impact(
+    trade_value: float,
+    volume: float,
+    price: float,
+    volatility: float,
+    config: ImpactConfig | None = None,
+) -> float:
+    """Estimate market impact cost (in price units) for a trade.
+
+    Returns the per-share impact cost to add to the base price (as a spread).
+    """
+    cfg = config or ImpactConfig()
+
+    if cfg.model == "none" or volume <= 0 or trade_value <= 0:
+        return 0.0
+
+    participation = min(trade_value / max(volume * price, 1.0), 1.0)
+    sqrt_qv = np.sqrt(participation / max(cfg.max_participation, 0.01))
+
+    if cfg.model == "square_root":
+        impact = cfg.impact_coefficient * volatility * sqrt_qv
+    elif cfg.model == "linear":
+        impact = cfg.impact_coefficient * volatility * participation
+    elif cfg.model == "almgren_chriss":
+        # Permanent + temporary impact
+        sigma = volatility * price
+        perm = cfg.ac_gamma * sigma
+        temp = cfg.ac_eta * sigma * np.sqrt(participation / 0.01)
+        impact = (perm + temp) / price
+    else:
+        impact = 0.0
+
+    return float(np.clip(impact * max(cfg.max_participation, 0.01) * price, 0.0, price * 0.05))
+
+
+def _walk_forward_impact_adjustment(
+    bar_count: int,
+    total_bars: int,
+    impact_config: ImpactConfig,
+) -> float:
+    """Decay impact for small orders as the algo walks the book."""
+    if total_bars <= 1:
+        return impact_config.temporary_impact * 0.5
+    # Over multiple bars, average impact decreases
+    return impact_config.temporary_impact * (0.5 + 0.5 / max(bar_count, 1))
+
+
+# ── Main Backtest ────────────────────────────────────────────────────────────
+
+
 def run_backtest(
     data: pd.DataFrame,
     strategy: RecursiveQTransformerStrategy,
     initial_cash: float = 1_000_000,
     commission_rate: float = 0.0003,
     stamp_duty_rate: float = 0.001,
+    slippage_model: str = "fixed",
+    slippage_value: float = 0.0,
     bars_per_year: int = 252,
     portfolio_size: int = 3,
+    impact_config: ImpactConfig | None = None,
+    portfolio_config: PortfolioConfig | None = None,
 ) -> BacktestResult:
     required = {"datetime", "open", "high", "low", "close", "volume"}
     missing = required - set(data.columns)
@@ -144,15 +236,26 @@ def run_backtest(
     df[symbol_column] = df[symbol_column].astype(str)
     df["datetime"] = pd.to_datetime(df["datetime"])
 
+    logger.info(
+        "Backtest start | symbols=%d cash=%.0f portfolio_size=%d slippage=%s/%.4f impact=%s",
+        df[symbol_column].nunique(), initial_cash, portfolio_size,
+        slippage_model, slippage_value, (impact_config or ImpactConfig()).model,
+    )
+
     cash = float(initial_cash)
     shares: dict[str, int] = {symbol: 0 for symbol in df[symbol_column].unique().tolist()}
     holding_bars: dict[str, int] = {symbol: 0 for symbol in shares}
+    # T+1 tracking: symbol -> list of (buy_dt, quantity) still locked
+    t1_locks: dict[str, list[tuple[pd.Timestamp, int]]] = {symbol: [] for symbol in shares}
     strategy_state: dict[str, RecursiveQTransformerStrategy] = {
         symbol: RecursiveQTransformerStrategy(replace(strategy.config))
         for symbol in shares
     }
     equity_curve: list[dict[str, float | str]] = []
     trades_log: list[dict[str, float | str]] = []
+    rejected_log: list[dict[str, float | str]] = []
+    # Risk accumulator
+    daily_pnl: dict[str, float] = {}
 
     symbol_frames = {
         symbol: frame.reset_index(drop=True)
@@ -164,7 +267,14 @@ def run_backtest(
     }
     symbol_indices = {symbol: -1 for symbol in symbol_frames}
     grouped = df.groupby("datetime", sort=True)
+    prev_snapshot: pd.DataFrame | None = None
     for dt, snapshot in grouped:
+        # Clear expired T+1 locks (previous trading day purchases are now sellable)
+        current_dt = pd.Timestamp(dt)
+        for symbol in t1_locks:
+            t1_locks[symbol] = [
+                (buy_dt, qty) for buy_dt, qty in t1_locks[symbol] if buy_dt >= current_dt
+            ]
         trading_open = _is_in_trade_window(pd.Timestamp(dt), strategy.config.trade_windows)
         signals: dict[str, float] = {}
         base_signals: dict[str, float] = {}
@@ -288,22 +398,53 @@ def run_backtest(
             if len(selected) >= portfolio_size:
                 break
         long_candidates = selected
-        long_weights_raw = _softmax([signal - strategy.config.buy_threshold for _, signal in long_candidates], strategy.config.rank_temperature)
-        raw_target_weights = {}
-        for (symbol, rank_score), weight in zip(long_candidates, long_weights_raw):
-            if shares[symbol] > 0 and not regime_on:
-                raw_target_weights[symbol] = min(weight, strategy.config.min_target_weight)
-                continue
-            event_strength = max(event_signals[symbol], 0.0) + max(regime_score, 0.0) * 0.25
-            group_strength = max(group_scores.get(groups[symbol], 0.0), 0.0)
-            signal_scale = strategy.config.min_signal_target_scale if rank_score > strategy.config.buy_threshold else 0.0
-            scaled_weight = weight * min(1.0, max(event_strength + group_strength, signal_scale))
-            raw_target_weights[symbol] = max(scaled_weight, 0.0)
-        target_weights = _cap_and_normalize(
-            raw_target_weights,
-            cap=strategy.config.max_position_weight,
-            gross_exposure=strategy.config.gross_exposure if regime_on else min(strategy.config.gross_exposure, 0.2),
-        )
+        # ── Portfolio Optimization ──────────────────────────────────────
+        # Build return history from score frames for optimizer
+        opt_returns: dict[str, pd.Series] = {}
+        for symbol in list(dict(long_candidates).keys()):
+            sf = score_frames[symbol]
+            if "signal" in sf.columns and len(sf) > 5:
+                opt_returns[symbol] = sf["signal"].iloc[-min(252, len(sf)):].diff().fillna(0.0)
+
+        if opt_returns and len(opt_returns) >= 2:
+            opt_returns_df = pd.DataFrame(opt_returns)
+            opt_cfg = portfolio_config or PortfolioConfig(
+                max_weight=strategy.config.max_position_weight,
+                gross_exposure=strategy.config.gross_exposure if regime_on else min(strategy.config.gross_exposure, 0.2),
+                method="mvo",
+            )
+            # Use signal scores as views for Black-Litterman
+            opt_views = {
+                symbol: max(base_signals[symbol], 0.0) * 0.5 + max(alpha_scores[symbol], 0.0) * 0.3
+                for symbol in list(dict(long_candidates).keys())
+            }
+            target_weights = optimize_portfolio(
+                opt_returns_df,
+                config=opt_cfg,
+                views=opt_views,
+                group_map=groups,
+            )
+        else:
+            # Fallback: use original softmax
+            long_weights_raw = _softmax(
+                [signal - strategy.config.buy_threshold for _, signal in long_candidates],
+                strategy.config.rank_temperature,
+            )
+            raw_target_weights = {}
+            for (symbol, rank_score), weight in zip(long_candidates, long_weights_raw):
+                if shares[symbol] > 0 and not regime_on:
+                    raw_target_weights[symbol] = min(weight, strategy.config.min_target_weight)
+                    continue
+                event_strength = max(event_signals[symbol], 0.0) + max(regime_score, 0.0) * 0.25
+                group_strength = max(group_scores.get(groups[symbol], 0.0), 0.0)
+                signal_scale = strategy.config.min_signal_target_scale if rank_score > strategy.config.buy_threshold else 0.0
+                scaled_weight = weight * min(1.0, max(event_strength + group_strength, signal_scale))
+                raw_target_weights[symbol] = max(scaled_weight, 0.0)
+            target_weights = _cap_and_normalize(
+                raw_target_weights,
+                cap=strategy.config.max_position_weight,
+                gross_exposure=strategy.config.gross_exposure if regime_on else min(strategy.config.gross_exposure, 0.2),
+            )
 
         equity_before = cash + sum(shares[symbol] * prices[symbol] for symbol in shares)
         target_shares = {}
@@ -325,47 +466,123 @@ def run_backtest(
                 raw_shares = shares[symbol]
             target_shares[symbol] = max(raw_shares, 0)
 
+        impact_cfg = impact_config or ImpactConfig()
+        market_contexts = build_market_contexts(snapshot, prev_snapshot)
+        prev_snapshot = snapshot.copy()
+
         if trading_open:
+            # Prepare impact estimates for each symbol
+            impact_costs: dict[str, float] = {}
+            for symbol in shares:
+                vol = float(snapshot[snapshot[symbol_column] == symbol]["volume"].iloc[-1]) if symbol in snapshot[symbol_column].values else 0
+                ctx = market_contexts.get(symbol)
+                if ctx is not None and vol > 0:
+                    impact = estimate_market_impact(
+                        trade_value=abs(target_shares.get(symbol, 0) - shares[symbol]) * prices[symbol],
+                        volume=vol,
+                        price=prices[symbol],
+                        volatility=float(score_frames[symbol]["volatility"].iloc[-1]) if "volatility" in score_frames[symbol].columns else 0.01,
+                        config=impact_cfg,
+                    )
+                    impact_costs[symbol] = impact
+            # ---- SELL phase ----
             for symbol, current_shares in shares.items():
-                price = prices[symbol]
-                signal = rank_scores[symbol]
                 desired_shares = target_shares[symbol]
                 delta = desired_shares - current_shares
-                if delta == 0:
+                if delta >= 0:
                     continue
-                if delta < 0:
-                    sell_size = abs(delta)
-                    gross = price * sell_size
-                    fees = gross * (commission_rate + stamp_duty_rate)
-                    cash += gross - fees
-                    shares[symbol] -= sell_size
-                    if shares[symbol] <= 0:
-                        holding_bars[symbol] = 0
-                    trades_log.append(
+                sell_size = abs(delta)
+
+                # T+1 check: cannot sell shares bought today
+                t1_locked = sum(qty for buy_dt, qty in t1_locks.get(symbol, []) if buy_dt == pd.Timestamp(dt))
+                sellable = max(current_shares - t1_locked, 0)
+                sell_size = min(sell_size, sellable)
+                if sell_size <= 0:
+                    rejected_log.append(
                         {
                             "datetime": str(dt),
                             "symbol": symbol,
                             "side": "sell",
-                            "price": price,
-                            "size": sell_size,
-                            "signal": signal,
-                            "fees": round(fees, 2),
-                            "target_weight": round(target_weights.get(symbol, 0.0), 6),
+                            "size": abs(delta),
+                            "reason": "t1_lock",
                         }
                     )
+                    continue
 
-            for symbol, current_shares in shares.items():
+                ctx = market_contexts.get(symbol)
                 price = prices[symbol]
+                impact = impact_costs.get(symbol, 0.0)
                 signal = rank_scores[symbol]
+                if ctx is not None:
+                    ok, fill_price, reason = can_trade(ctx, "sell", slippage_model=slippage_model, slippage_value=slippage_value)
+                    if not ok:
+                        rejected_log.append(
+                            {
+                                "datetime": str(dt),
+                                "symbol": symbol,
+                                "side": "sell",
+                                "size": sell_size,
+                                "reason": reason,
+                            }
+                        )
+                        continue
+                    # Apply market impact (sell: price reduced by impact)
+                    fill_price = fill_price * (1.0 - impact / max(price, 1e-6))
+                    price = fill_price
+
+                gross = price * sell_size
+                fees = gross * (commission_rate + stamp_duty_rate)
+                cash += gross - fees
+                shares[symbol] -= sell_size
+                if shares[symbol] <= 0:
+                    holding_bars[symbol] = 0
+                trades_log.append(
+                    {
+                        "datetime": str(dt),
+                        "symbol": symbol,
+                        "side": "sell",
+                        "price": price,
+                        "size": sell_size,
+                        "signal": signal,
+                        "fees": round(fees, 2),
+                        "target_weight": round(target_weights.get(symbol, 0.0), 6),
+                    }
+                )
+
+            # ---- BUY phase ----
+            for symbol, current_shares in shares.items():
                 desired_shares = target_shares[symbol]
                 delta = desired_shares - current_shares
                 if delta <= 0:
                     continue
+
+                ctx = market_contexts.get(symbol)
+                price = prices[symbol]
+                impact = impact_costs.get(symbol, 0.0)
+                signal = rank_scores[symbol]
+                if ctx is not None:
+                    ok, fill_price, reason = can_trade(ctx, "buy", slippage_model=slippage_model, slippage_value=slippage_value)
+                    if not ok:
+                        rejected_log.append(
+                            {
+                                "datetime": str(dt),
+                                "symbol": symbol,
+                                "side": "buy",
+                                "size": delta,
+                                "reason": reason,
+                            }
+                        )
+                        continue
+                    # Apply market impact (buy: price increased by impact)
+                    fill_price = fill_price * (1.0 + impact / max(price, 1e-6))
+                    price = fill_price
+
                 gross = price * delta
                 fees = gross * commission_rate
                 if cash >= gross + fees:
                     cash -= gross + fees
                     shares[symbol] += delta
+                    t1_locks[symbol].append((pd.Timestamp(dt), delta))
                     trades_log.append(
                         {
                             "datetime": str(dt),
@@ -406,14 +623,27 @@ def run_backtest(
     returns = equity_df["equity"].pct_change().fillna(0.0)
     final_equity = float(equity_df["equity"].iloc[-1]) if not equity_df.empty else initial_cash
     total_return = final_equity / initial_cash - 1.0
+    mdd = _max_drawdown(equity_df["equity"])
+    ann_ret = _annualize(total_return, len(equity_df), bars_per_year)
+
+    logger.info(
+        "Backtest complete | return=%.2f%% ann=%.2f%% sharpe=%.2f maxdd=%.2f%% trades=%d/%d",
+        total_return * 100, ann_ret * 100,
+        _sharpe(returns, bars_per_year), mdd * 100,
+        len(trades_log), len(rejected_log),
+    )
+
     return BacktestResult(
         bars=len(df),
         trades=len(trades_log),
+        rejected=len(rejected_log),
         final_equity=round(final_equity, 2),
         total_return=round(total_return, 6),
-        annual_return=round(_annualize(total_return, len(equity_df), bars_per_year), 6),
-        max_drawdown=round(_max_drawdown(equity_df["equity"]), 6),
+        annual_return=round(ann_ret, 6),
+        max_drawdown=round(mdd, 6),
         sharpe=round(_sharpe(returns, bars_per_year), 6),
+        calmar=round(_calmar(ann_ret, mdd), 6),
         equity_curve=equity_curve,
         trades_log=trades_log,
+        rejected_log=rejected_log,
     )

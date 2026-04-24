@@ -73,8 +73,24 @@ def make_manual_quote(symbol: str, price: float, source: str = "manual") -> Quot
 
 
 def detect_market(symbol: str) -> int:
-    if symbol.startswith(("5", "6", "9")):
+    """Detect TDX market code for A-share symbols.
+
+    Rules:
+        - Shanghai (market=1): 600*, 601*, 603*, 605*, 688*, 689* (科创),
+          900* (B股), 51* (ETF), 50* (国债), 99* (指数)
+        - Shenzhen (market=0): 000*, 001*, 002*, 003*, 300* (创业板),
+          301* (创业板), 200* (B股), 15* (ETF), 10* (国债), 39* (指数)
+        - Beijing (market=0 via fallback): 8*, 43*, 83*, 87*, 88*
+    """
+    if not symbol:
+        return 0
+    s = symbol.strip()
+    if s.startswith(("6", "9", "5")):
         return 1
+    if s.startswith(("0", "1", "2", "3", "15", "10", "39")):
+        return 0
+    if s.startswith(("8", "43", "83", "87", "88")):
+        return 0
     return 0
 
 

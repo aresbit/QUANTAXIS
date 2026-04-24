@@ -10,7 +10,7 @@ from QUANTAXIS.ashare.broker import Order, PaperBroker
 from QUANTAXIS.ashare.quotes import PytdxQuoteClient, make_manual_quote
 from QUANTAXIS.ashare.runner import dump_run_result, run_once_from_config
 from QUANTAXIS.backtest.data import fetch_ashare_bars, fetch_ashare_portfolio_bars, load_multi_ohlcv_csv, load_ohlcv_csv
-from QUANTAXIS.backtest.engine import run_backtest
+from QUANTAXIS.backtest.engine import ImpactConfig, run_backtest
 from QUANTAXIS.backtest.plot import save_backtest_figure
 from QUANTAXIS.backtest.strategy import RecursiveQTransformerStrategy, StrategyConfig
 
@@ -86,9 +86,41 @@ def _add_backtest_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
     parser.add_argument("--group", action="append", default=[], help="override group as SYMBOL:GROUP")
     parser.add_argument("--initial-cash", type=float, default=1_000_000)
     parser.add_argument("--allow-short", action="store_true")
+    parser.add_argument("--slippage-model", default="fixed", choices=["fixed", "percent", "impact"])
+    parser.add_argument("--slippage-value", type=float, default=0.0)
+    parser.add_argument("--impact-model", default="square_root", choices=["square_root", "linear", "almgren_chriss", "none"])
+    parser.add_argument("--impact-coefficient", type=float, default=0.1)
     parser.add_argument("--export-equity")
     parser.add_argument("--plot")
     parser.set_defaults(command="backtest")
+
+
+def _add_research_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("research", help="run research analysis (IC, walk-forward, grid search)")
+    sub = parser.add_subparsers(dest="research_command", required=True)
+
+    # IC analysis
+    ic = sub.add_parser("ic", help="factor IC analysis")
+    ic.add_argument("--csv", required=True)
+    ic.add_argument("--factor", default="signal", help="factor column name")
+    ic.add_argument("--forward-return", default="return_1", help="forward return column name")
+
+    # Walk-forward
+    wf = sub.add_parser("walkforward", help="walk-forward backtest")
+    wf.add_argument("--csv", required=True)
+    wf.add_argument("--window", type=int, default=252)
+    wf.add_argument("--step", type=int, default=63)
+    wf.add_argument("--portfolio-size", type=int, default=3)
+    wf.add_argument("--buy-threshold", type=float, default=0.02)
+    wf.add_argument("--initial-cash", type=float, default=1_000_000)
+
+    # Grid search
+    gs = sub.add_parser("gridsearch", help="parameter grid search")
+    gs.add_argument("--csv", required=True)
+    gs.add_argument("--param", action="append", default=[], help="PARAM:val1,val2,val3")
+    gs.add_argument("--scoring", default="sharpe", choices=["sharpe", "return", "calmar"])
+    gs.add_argument("--initial-cash", type=float, default=1_000_000)
+    parser.set_defaults(command="research")
 
 
 def _load_backtest_frame(args: argparse.Namespace) -> pd.DataFrame:
@@ -173,7 +205,19 @@ def _run_backtest(args: argparse.Namespace) -> int:
     )
     strategy = RecursiveQTransformerStrategy(config)
     bars_per_year = 252 if args.frequency == "day" else {"1min": 252 * 240, "5min": 252 * 48, "15min": 252 * 16, "30min": 252 * 8, "60min": 252 * 4}[args.frequency]
-    result = run_backtest(frame, strategy, initial_cash=args.initial_cash, bars_per_year=bars_per_year, portfolio_size=args.portfolio_size)
+    imp_cfg = ImpactConfig(
+        model=args.impact_model,
+        impact_coefficient=args.impact_coefficient,
+    )
+    result = run_backtest(
+        frame, strategy,
+        initial_cash=args.initial_cash,
+        bars_per_year=bars_per_year,
+        portfolio_size=args.portfolio_size,
+        slippage_model=args.slippage_model,
+        slippage_value=args.slippage_value,
+        impact_config=imp_cfg,
+    )
     if args.export_equity:
         export_path = Path(args.export_equity)
         export_path.parent.mkdir(parents=True, exist_ok=True)
@@ -193,6 +237,77 @@ def _run_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_research(args: argparse.Namespace) -> int:
+    from QUANTAXIS.backtest.data import load_ohlcv_csv
+    from QUANTAXIS.backtest.research import factor_ic_analysis, grid_search, walk_forward
+
+    frame = load_ohlcv_csv(args.csv)
+
+    if args.research_command == "ic":
+        factor = frame[args.factor] if args.factor in frame else frame.get("signal", pd.Series(dtype=float))
+        fwd = frame[args.forward_return] if args.forward_return in frame else frame["return_1"]
+        report = factor_ic_analysis(factor, fwd, factor_name=args.factor)
+        print(json.dumps({k: round(v, 6) if isinstance(v, float) else v for k, v in vars(report).items()},
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    if args.research_command == "walkforward":
+        from QUANTAXIS.backtest.strategy import RecursiveQTransformerStrategy, StrategyConfig
+
+        def _builder(train_data):
+            return RecursiveQTransformerStrategy(StrategyConfig(buy_threshold=args.buy_threshold))
+
+        result = walk_forward(
+            frame, _builder, run_backtest,
+            window=args.window, step=args.step,
+            initial_cash=args.initial_cash,
+            portfolio_size=args.portfolio_size,
+        )
+        print(json.dumps({
+            "folds": result.folds,
+            "oos_sharpe_mean": round(result.oos_sharpe_mean, 4),
+            "oos_sharpe_std": round(result.oos_sharpe_std, 4),
+            "oos_return_mean": round(result.oos_return_mean, 6),
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.research_command == "gridsearch":
+        from QUANTAXIS.backtest.strategy import RecursiveQTransformerStrategy
+
+        param_grid: dict[str, list[float]] = {}
+        for item in args.param:
+            key, _, values = item.partition(":")
+            if not key or not values:
+                raise ValueError(f"invalid --param: {item!r}, expected KEY:v1,v2,v3")
+            param_grid[key] = [float(v) for v in values.split(",")]
+
+        result = grid_search(
+            frame, RecursiveQTransformerStrategy, param_grid, run_backtest,
+            scoring=args.scoring, initial_cash=args.initial_cash,
+        )
+        print(json.dumps({
+            "best_params": result.best_params,
+            "best_score": round(result.best_score, 6),
+            "param_importance": result.param_importance,
+            "n_trials": len(result.all_results),
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    raise ValueError(f"unknown research command: {args.research_command}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="quantaxis-a")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    _add_quote_parser(subparsers)
+    _add_paper_order_parser(subparsers, "paper-buy")
+    _add_paper_order_parser(subparsers, "paper-sell")
+    _add_run_parser(subparsers)
+    _add_backtest_parser(subparsers)
+    _add_research_parser(subparsers)
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -208,5 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "backtest":
         return _run_backtest(args)
+    if args.command == "research":
+        return _run_research(args)
     parser.error(f"unsupported command: {args.command}")
     return 2

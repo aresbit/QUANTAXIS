@@ -18,16 +18,64 @@ PYTDX_KLINE_TYPES = {
 }
 
 
-def load_ohlcv_csv(path: str | Path) -> pd.DataFrame:
-    frame = pd.read_csv(path)
+def validate_ohlcv_frame(frame: pd.DataFrame, context: str = "data") -> pd.DataFrame:
+    """Validate and clean OHLCV data. Returns cleaned frame or raises."""
     required = {"datetime", "open", "high", "low", "close", "volume"}
     missing = required - set(frame.columns)
     if missing:
-        raise ValueError(f"missing required columns: {sorted(missing)}")
-    frame["datetime"] = pd.to_datetime(frame["datetime"])
+        raise ValueError(f"[{context}] missing required columns: {sorted(missing)}")
+
+    frame = frame.copy()
+    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
     for column in ["open", "high", "low", "close", "volume"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    return frame.dropna(subset=["datetime", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
+
+    # Drop rows with NaN in core fields
+    before_drop = len(frame)
+    frame = frame.dropna(subset=["datetime", "open", "high", "low", "close", "volume"])
+    after_drop = len(frame)
+    if after_drop < before_drop:
+        print(f"[{context}] dropped {before_drop - after_drop} rows with NaN values")
+
+    # Price sanity checks
+    invalid_ohlc = (
+        (frame["high"] < frame["low"])
+        | (frame["close"] > frame["high"])
+        | (frame["close"] < frame["low"])
+        | (frame["open"] > frame["high"])
+        | (frame["open"] < frame["low"])
+    )
+    bad = invalid_ohlc.sum()
+    if bad > 0:
+        print(f"[{context}] found {bad} rows with invalid OHLC relationship; clamping")
+        frame.loc[invalid_ohlc, "high"] = frame.loc[invalid_ohlc, ["open", "high", "low", "close"]].max(axis=1)
+        frame.loc[invalid_ohlc, "low"] = frame.loc[invalid_ohlc, ["open", "high", "low", "close"]].min(axis=1)
+
+    # Detect limit-up/limit-down (≈ 20% for GEM/STAR, 10% for main)
+    frame["prev_close"] = frame["close"].shift(1)
+    frame["daily_return"] = (frame["close"] / frame["prev_close"] - 1.0).fillna(0.0)
+    extreme_moves = frame["daily_return"].abs() > 0.22
+    if extreme_moves.sum() > 0:
+        print(f"[{context}] warning: {extreme_moves.sum()} bars with >22% daily move (possible bad adjustment)")
+
+    # Detect suspicious volume spikes (>20x median)
+    median_vol = frame["volume"].median()
+    if median_vol > 0:
+        vol_spikes = frame["volume"] > median_vol * 20
+        if vol_spikes.sum() > 0:
+            print(f"[{context}] warning: {vol_spikes.sum()} bars with volume >20x median")
+
+    # Detect zero-volume bars
+    zero_vol = frame["volume"] == 0
+    if zero_vol.sum() > 0:
+        print(f"[{context}] warning: {zero_vol.sum()} zero-volume bars (possible suspension)")
+
+    return frame.reset_index(drop=True)
+
+
+def load_ohlcv_csv(path: str | Path) -> pd.DataFrame:
+    frame = pd.read_csv(path)
+    return validate_ohlcv_frame(frame, context=f"csv:{path}")
 
 
 def load_multi_ohlcv_csv(path: str | Path) -> pd.DataFrame:
