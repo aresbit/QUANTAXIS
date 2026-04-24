@@ -67,6 +67,9 @@ def _add_backtest_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
     parser.add_argument("--adjust", default="")
     parser.add_argument("--source", default="auto", choices=["auto", "akshare", "pytdx"])
     parser.add_argument("--frequency", default="day", choices=["1min", "5min", "15min", "30min", "60min", "day"])
+    parser.add_argument("--cache-dir", default="outputs/data_cache")
+    parser.add_argument("--refresh-cache", action="store_true")
+    parser.add_argument("--execution-mode", default="research", choices=["research", "paper", "paper_strict"])
     parser.add_argument("--portfolio-size", type=int, default=3)
     parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--hidden-dim", type=int, default=8)
@@ -88,7 +91,7 @@ def _add_backtest_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
     parser.add_argument("--allow-short", action="store_true")
     parser.add_argument("--slippage-model", default="fixed", choices=["fixed", "percent", "impact"])
     parser.add_argument("--slippage-value", type=float, default=0.0)
-    parser.add_argument("--impact-model", default="square_root", choices=["square_root", "linear", "almgren_chriss", "none"])
+    parser.add_argument("--impact-model", default="none", choices=["square_root", "linear", "almgren_chriss", "none"])
     parser.add_argument("--impact-coefficient", type=float, default=0.1)
     parser.add_argument("--export-equity")
     parser.add_argument("--plot")
@@ -129,9 +132,27 @@ def _load_backtest_frame(args: argparse.Namespace) -> pd.DataFrame:
     if args.multi_csv:
         return load_multi_ohlcv_csv(args.multi_csv)
     if args.symbols and args.start and args.end:
-        return fetch_ashare_portfolio_bars(args.symbols, args.start, args.end, frequency=args.frequency, adjust=args.adjust, source=args.source)
+        return fetch_ashare_portfolio_bars(
+            args.symbols,
+            args.start,
+            args.end,
+            frequency=args.frequency,
+            adjust=args.adjust,
+            source=args.source,
+            cache_dir=args.cache_dir,
+            refresh_cache=args.refresh_cache,
+        )
     if args.symbol and args.start and args.end:
-        return fetch_ashare_bars(args.symbol, args.start, args.end, frequency=args.frequency, adjust=args.adjust, source=args.source)
+        return fetch_ashare_bars(
+            args.symbol,
+            args.start,
+            args.end,
+            frequency=args.frequency,
+            adjust=args.adjust,
+            source=args.source,
+            cache_dir=args.cache_dir,
+            refresh_cache=args.refresh_cache,
+        )
     raise ValueError("backtest requires --csv/--multi-csv or --symbol(s)/--start/--end")
 
 
@@ -202,6 +223,7 @@ def _run_backtest(args: argparse.Namespace) -> int:
         per_group_limit=args.per_group_limit,
         symbol_groups=_resolve_symbol_groups(args),
         allow_short=args.allow_short,
+        trade_windows=() if args.frequency == "day" else StrategyConfig().trade_windows,
     )
     strategy = RecursiveQTransformerStrategy(config)
     bars_per_year = 252 if args.frequency == "day" else {"1min": 252 * 240, "5min": 252 * 48, "15min": 252 * 16, "30min": 252 * 8, "60min": 252 * 4}[args.frequency]
@@ -217,6 +239,7 @@ def _run_backtest(args: argparse.Namespace) -> int:
         slippage_model=args.slippage_model,
         slippage_value=args.slippage_value,
         impact_config=imp_cfg,
+        execution_mode=args.execution_mode,
     )
     if args.export_equity:
         export_path = Path(args.export_equity)

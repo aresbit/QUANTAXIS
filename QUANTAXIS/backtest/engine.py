@@ -220,7 +220,10 @@ def run_backtest(
     portfolio_size: int = 3,
     impact_config: ImpactConfig | None = None,
     portfolio_config: PortfolioConfig | None = None,
+    execution_mode: str = "research",
 ) -> BacktestResult:
+    if execution_mode not in {"research", "paper", "paper_strict"}:
+        raise ValueError("execution_mode must be one of: research, paper, paper_strict")
     required = {"datetime", "open", "high", "low", "close", "volume"}
     missing = required - set(data.columns)
     if missing:
@@ -236,10 +239,19 @@ def run_backtest(
     df[symbol_column] = df[symbol_column].astype(str)
     df["datetime"] = pd.to_datetime(df["datetime"])
 
+    if execution_mode in {"paper", "paper_strict"}:
+        if impact_config is None:
+            impact_config = ImpactConfig(model="square_root", impact_coefficient=0.03)
+        if slippage_model == "fixed" and slippage_value == 0.0:
+            slippage_model = "percent"
+            slippage_value = 0.0005
+    elif impact_config is None:
+        impact_config = ImpactConfig(model="none")
+
     logger.info(
         "Backtest start | symbols=%d cash=%.0f portfolio_size=%d slippage=%s/%.4f impact=%s",
         df[symbol_column].nunique(), initial_cash, portfolio_size,
-        slippage_model, slippage_value, (impact_config or ImpactConfig()).model,
+        slippage_model, slippage_value, impact_config.model,
     )
 
     cash = float(initial_cash)
@@ -266,15 +278,20 @@ def run_backtest(
         for symbol, frame in symbol_frames.items()
     }
     symbol_indices = {symbol: -1 for symbol in symbol_frames}
+    last_prices: dict[str, float] = {}
     grouped = df.groupby("datetime", sort=True)
     prev_snapshot: pd.DataFrame | None = None
     for dt, snapshot in grouped:
-        # Clear expired T+1 locks (previous trading day purchases are now sellable)
+        use_execution_rules = execution_mode in {"paper", "paper_strict"}
+
+        # Clear expired T+1 locks (previous trading day purchases are now sellable).
+        # Research mode does not apply T+1 so alpha tests remain comparable.
         current_dt = pd.Timestamp(dt)
-        for symbol in t1_locks:
-            t1_locks[symbol] = [
-                (buy_dt, qty) for buy_dt, qty in t1_locks[symbol] if buy_dt >= current_dt
-            ]
+        if use_execution_rules:
+            for symbol in t1_locks:
+                t1_locks[symbol] = [
+                    (buy_dt, qty) for buy_dt, qty in t1_locks[symbol] if buy_dt >= current_dt
+                ]
         trading_open = _is_in_trade_window(pd.Timestamp(dt), strategy.config.trade_windows)
         signals: dict[str, float] = {}
         base_signals: dict[str, float] = {}
@@ -304,6 +321,7 @@ def run_backtest(
             trade_point_scores[symbol] = float(score.get("trade_point_score", 0.0))
             groups[symbol] = strategy.config.symbol_groups.get(symbol, "default")
             prices[symbol] = float(row_now["close"])
+        last_prices.update(prices)
 
         regime_on, regime_score = _compute_market_regime(
             base_signals=base_signals,
@@ -453,9 +471,13 @@ def run_backtest(
                 gross_exposure=strategy.config.gross_exposure if regime_on else min(strategy.config.gross_exposure, 0.2),
             )
 
-        equity_before = cash + sum(shares[symbol] * prices[symbol] for symbol in shares)
+        mark_prices = {symbol: prices.get(symbol, last_prices.get(symbol, 0.0)) for symbol in shares}
+        equity_before = cash + sum(shares[symbol] * mark_prices[symbol] for symbol in shares)
         target_shares = {}
         for symbol in shares:
+            if symbol not in prices:
+                target_shares[symbol] = shares[symbol]
+                continue
             weight = target_weights.get(symbol, 0.0)
             if not regime_on and strategy.config.exit_on_regime_off:
                 weight = 0.0
@@ -473,14 +495,16 @@ def run_backtest(
                 raw_shares = shares[symbol]
             target_shares[symbol] = max(raw_shares, 0)
 
-        impact_cfg = impact_config or ImpactConfig()
-        market_contexts = build_market_contexts(snapshot, prev_snapshot)
+        impact_cfg = impact_config
+        market_contexts = build_market_contexts(snapshot, prev_snapshot) if use_execution_rules else {}
         prev_snapshot = snapshot.copy()
 
         if trading_open:
             # Prepare impact estimates for each symbol
             impact_costs: dict[str, float] = {}
             for symbol in shares:
+                if symbol not in prices:
+                    continue
                 vol = float(snapshot[snapshot[symbol_column] == symbol]["volume"].iloc[-1]) if symbol in snapshot[symbol_column].values else 0
                 ctx = market_contexts.get(symbol)
                 if ctx is not None and vol > 0:
@@ -494,33 +518,36 @@ def run_backtest(
                     impact_costs[symbol] = impact
             # ---- SELL phase ----
             for symbol, current_shares in shares.items():
+                if symbol not in prices:
+                    continue
                 desired_shares = target_shares[symbol]
                 delta = desired_shares - current_shares
                 if delta >= 0:
                     continue
                 sell_size = abs(delta)
 
-                # T+1 check: cannot sell shares bought today
-                t1_locked = sum(qty for buy_dt, qty in t1_locks.get(symbol, []) if buy_dt == pd.Timestamp(dt))
-                sellable = max(current_shares - t1_locked, 0)
-                sell_size = min(sell_size, sellable)
-                if sell_size <= 0:
-                    rejected_log.append(
-                        {
-                            "datetime": str(dt),
-                            "symbol": symbol,
-                            "side": "sell",
-                            "size": abs(delta),
-                            "reason": "t1_lock",
-                        }
-                    )
-                    continue
+                if use_execution_rules:
+                    # T+1 check: cannot sell shares bought today
+                    t1_locked = sum(qty for buy_dt, qty in t1_locks.get(symbol, []) if buy_dt == pd.Timestamp(dt))
+                    sellable = max(current_shares - t1_locked, 0)
+                    sell_size = min(sell_size, sellable)
+                    if sell_size <= 0:
+                        rejected_log.append(
+                            {
+                                "datetime": str(dt),
+                                "symbol": symbol,
+                                "side": "sell",
+                                "size": abs(delta),
+                                "reason": "t1_lock",
+                            }
+                        )
+                        continue
 
                 ctx = market_contexts.get(symbol)
                 price = prices[symbol]
                 impact = impact_costs.get(symbol, 0.0)
                 signal = rank_scores[symbol]
-                if ctx is not None:
+                if use_execution_rules and ctx is not None:
                     ok, fill_price, reason = can_trade(ctx, "sell", slippage_model=slippage_model, slippage_value=slippage_value)
                     if not ok:
                         rejected_log.append(
@@ -558,6 +585,8 @@ def run_backtest(
 
             # ---- BUY phase ----
             for symbol, current_shares in shares.items():
+                if symbol not in prices:
+                    continue
                 desired_shares = target_shares[symbol]
                 delta = desired_shares - current_shares
                 if delta <= 0:
@@ -567,7 +596,7 @@ def run_backtest(
                 price = prices[symbol]
                 impact = impact_costs.get(symbol, 0.0)
                 signal = rank_scores[symbol]
-                if ctx is not None:
+                if use_execution_rules and ctx is not None:
                     ok, fill_price, reason = can_trade(ctx, "buy", slippage_model=slippage_model, slippage_value=slippage_value)
                     if not ok:
                         rejected_log.append(
@@ -589,7 +618,8 @@ def run_backtest(
                 if cash >= gross + fees:
                     cash -= gross + fees
                     shares[symbol] += delta
-                    t1_locks[symbol].append((pd.Timestamp(dt), delta))
+                    if use_execution_rules:
+                        t1_locks[symbol].append((pd.Timestamp(dt), delta))
                     trades_log.append(
                         {
                             "datetime": str(dt),
@@ -606,7 +636,7 @@ def run_backtest(
         for symbol, share_count in shares.items():
             holding_bars[symbol] = holding_bars[symbol] + 1 if share_count > 0 else 0
 
-        mark_to_market = cash + sum(shares[symbol] * prices[symbol] for symbol in shares)
+        mark_to_market = cash + sum(shares[symbol] * mark_prices[symbol] for symbol in shares)
         avg_signal = sum(signals.values()) / len(signals) if signals else 0.0
         avg_rank_signal = sum(rank_scores.values()) / len(rank_scores) if rank_scores else 0.0
         avg_price = sum(prices.values()) / len(prices) if prices else 0.0
@@ -622,7 +652,7 @@ def run_backtest(
                 "equity": round(mark_to_market, 2),
                 "active_positions": sum(1 for value in shares.values() if value > 0),
                 "trade_window_open": 1 if trading_open else 0,
-                "gross_exposure": round(sum(shares[symbol] * prices[symbol] for symbol in shares) / mark_to_market, 6) if mark_to_market else 0.0,
+                "gross_exposure": round(sum(shares[symbol] * mark_prices[symbol] for symbol in shares) / mark_to_market, 6) if mark_to_market else 0.0,
             }
         )
 

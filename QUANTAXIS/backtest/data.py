@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 from pathlib import Path
 
 import pandas as pd
@@ -16,6 +17,47 @@ PYTDX_KLINE_TYPES = {
     "60min": 3,
     "day": 9,
 }
+
+AKSHARE_MINUTE_PERIODS = {
+    "1min": "1",
+    "5min": "5",
+    "15min": "15",
+    "30min": "30",
+    "60min": "60",
+}
+
+
+DEFAULT_CACHE_DIR = Path("outputs/data_cache")
+
+
+def _cache_key(*parts: object) -> str:
+    raw = "|".join(str(part) for part in parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_path(
+    cache_dir: str | Path,
+    source: str,
+    frequency: str,
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    adjust: str,
+) -> Path:
+    safe_adjust = adjust or "none"
+    name = f"{symbol}_{start_date}_{end_date}_{safe_adjust}_{_cache_key(source, frequency, symbol, start_date, end_date, adjust)}.csv"
+    return Path(cache_dir) / source / frequency / name
+
+
+def _read_cached_frame(path: Path) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    return load_multi_ohlcv_csv(path)
+
+
+def _write_cached_frame(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False)
 
 
 def validate_ohlcv_frame(frame: pd.DataFrame, context: str = "data") -> pd.DataFrame:
@@ -260,6 +302,51 @@ def _fetch_ashare_bars_pytdx(
     raise RuntimeError(f"failed to fetch TDX history for {symbol}: {last_error}") from last_error
 
 
+def _fetch_ashare_bars_akshare(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    frequency: str,
+    adjust: str = "",
+) -> pd.DataFrame:
+    try:
+        import akshare as ak
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "akshare is required for historical A-share minute data. Install it with `uv sync --extra research`."
+        ) from exc
+
+    if frequency not in AKSHARE_MINUTE_PERIODS:
+        raise ValueError(f"unsupported akshare minute frequency: {frequency}")
+
+    raw = ak.stock_zh_a_hist_min_em(
+        symbol=symbol,
+        start_date=f"{start_date} 09:30:00",
+        end_date=f"{end_date} 15:00:00",
+        period=AKSHARE_MINUTE_PERIODS[frequency],
+        adjust=adjust,
+    )
+    renamed = raw.rename(
+        columns={
+            "时间": "datetime",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "最新价": "close",
+        }
+    )
+    if renamed.empty:
+        raise RuntimeError(f"no akshare minute history returned for {symbol} between {start_date} and {end_date}")
+
+    columns = ["datetime", "open", "high", "low", "close", "volume"]
+    if "amount" in renamed.columns:
+        columns.append("amount")
+    return _normalize_ohlcv_frame(renamed.loc[:, [column for column in columns if column in renamed.columns]], symbol)
+
+
 def fetch_ashare_daily(
     symbol: str,
     start_date: str,
@@ -287,12 +374,33 @@ def fetch_ashare_bars(
     frequency: str = "day",
     adjust: str = "",
     source: str = "auto",
+    cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
+    refresh_cache: bool = False,
 ) -> pd.DataFrame:
+    path = _cache_path(cache_dir, source, frequency, symbol, start_date, end_date, adjust) if cache_dir else None
+    if path is not None and not refresh_cache:
+        cached = _read_cached_frame(path)
+        if cached is not None:
+            return cached
+
     if frequency == "day":
-        return fetch_ashare_daily(symbol, start_date, end_date, adjust=adjust, source=source)
-    if source not in {"auto", "pytdx"}:
-        raise ValueError("minute-level A-share backtest currently supports only `pytdx` or `auto` sources")
-    return _fetch_ashare_bars_pytdx(symbol, start_date, end_date, frequency=frequency)
+        frame = fetch_ashare_daily(symbol, start_date, end_date, adjust=adjust, source=source)
+    else:
+        if source == "akshare":
+            frame = _fetch_ashare_bars_akshare(symbol, start_date, end_date, frequency=frequency, adjust=adjust)
+        elif source == "pytdx":
+            frame = _fetch_ashare_bars_pytdx(symbol, start_date, end_date, frequency=frequency)
+        elif source == "auto":
+            try:
+                frame = _fetch_ashare_bars_pytdx(symbol, start_date, end_date, frequency=frequency)
+            except Exception:
+                frame = _fetch_ashare_bars_akshare(symbol, start_date, end_date, frequency=frequency, adjust=adjust)
+        else:
+            raise ValueError("minute-level A-share backtest supports `pytdx`, `akshare`, or `auto` sources")
+
+    if path is not None:
+        _write_cached_frame(path, frame)
+    return frame
 
 
 def fetch_ashare_portfolio_bars(
@@ -302,6 +410,8 @@ def fetch_ashare_portfolio_bars(
     frequency: str = "day",
     adjust: str = "",
     source: str = "auto",
+    cache_dir: str | Path | None = DEFAULT_CACHE_DIR,
+    refresh_cache: bool = False,
 ) -> pd.DataFrame:
     if not symbols:
         raise ValueError("symbols list is empty")
@@ -309,7 +419,16 @@ def fetch_ashare_portfolio_bars(
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         frames = list(
             executor.map(
-                lambda symbol: fetch_ashare_bars(symbol, start_date, end_date, frequency=frequency, adjust=adjust, source=source),
+                lambda symbol: fetch_ashare_bars(
+                    symbol,
+                    start_date,
+                    end_date,
+                    frequency=frequency,
+                    adjust=adjust,
+                    source=source,
+                    cache_dir=cache_dir,
+                    refresh_cache=refresh_cache,
+                ),
                 symbols,
             )
         )
