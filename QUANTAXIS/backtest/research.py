@@ -49,11 +49,12 @@ def compute_rank_ic(
     factor: pd.Series,
     forward_returns: pd.Series,
 ) -> float:
-    """Spearman rank correlation between factor value and forward return."""
+    """Spearman rank IC: rank-transform then Pearson (no scipy required)."""
     clean = pd.concat([factor, forward_returns], axis=1).dropna()
     if len(clean) < 10:
         return 0.0
-    return float(clean.iloc[:, 0].corr(clean.iloc[:, 1], method="spearman"))
+    ranked = clean.rank()
+    return float(ranked.iloc[:, 0].corr(ranked.iloc[:, 1], method="pearson"))
 
 
 def compute_normal_ic(
@@ -138,7 +139,7 @@ def factor_ic_analysis(
             decay.append(0.0)
             continue
         decay.append(float(
-            clean["factor"].shift(lag).corr(clean["forward_return"], method="spearman")
+            clean["factor"].shift(lag).corr(clean["forward_return"], method="pearson")
         ))
 
     # Factor turnover (rank correlation stability)
@@ -151,7 +152,7 @@ def factor_ic_analysis(
                 curr = clean.loc[dates[i]]["factor"].rank()
                 common = prev.index.intersection(curr.index)
                 if len(common) > 1:
-                    rank_changes.append(prev[common].corr(curr[common], method="spearman"))
+                    rank_changes.append(prev[common].corr(curr[common], method="pearson"))
             turnover = 1.0 - np.mean(rank_changes) if rank_changes else 1.0
         else:
             turnover = 1.0

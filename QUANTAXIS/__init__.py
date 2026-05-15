@@ -9,18 +9,27 @@ from QUANTAXIS.ashare.broker import EasyTraderBroker, ExecutionReport, Order, Pa
 from QUANTAXIS.ashare.quotes import PytdxQuoteClient, Quote
 from QUANTAXIS.ashare.runner import run_once_from_config
 from QUANTAXIS.backtest.data import fetch_ashare_daily, load_ohlcv_csv
-from QUANTAXIS.backtest.engine import BacktestResult, run_backtest
+from QUANTAXIS.backtest.engine import BacktestResult, EngineConfig, StrategyProtocol, run_backtest
 from QUANTAXIS.backtest.plot import save_backtest_figure
 from QUANTAXIS.backtest.strategy import RecursiveQTransformerStrategy, StrategyConfig
+from QUANTAXIS.QAExchange.okx_client import OKXClient, OKXConfig
+from QUANTAXIS.QAExchange.okx_trader import LiveOrder, LivePosition, LiveRiskConfig, OKXTrader, TradingSession
 
 __author__ = "yutiansut"
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 _DIRECT_EXPORTS = {
     "AccountSnapshot": AccountSnapshot,
     "BacktestResult": BacktestResult,
     "EasyTraderBroker": EasyTraderBroker,
+    "EngineConfig": EngineConfig,
     "ExecutionReport": ExecutionReport,
+    "LiveOrder": LiveOrder,
+    "LivePosition": LivePosition,
+    "LiveRiskConfig": LiveRiskConfig,
+    "OKXClient": OKXClient,
+    "OKXConfig": OKXConfig,
+    "OKXTrader": OKXTrader,
     "Order": Order,
     "PaperBroker": PaperBroker,
     "Position": Position,
@@ -28,6 +37,8 @@ _DIRECT_EXPORTS = {
     "Quote": Quote,
     "RecursiveQTransformerStrategy": RecursiveQTransformerStrategy,
     "StrategyConfig": StrategyConfig,
+    "StrategyProtocol": StrategyProtocol,
+    "TradingSession": TradingSession,
     "fetch_ashare_daily": fetch_ashare_daily,
     "load_ohlcv_csv": load_ohlcv_csv,
     "run_backtest": run_backtest,
@@ -70,7 +81,7 @@ _LEGACY_ATTRS = {
     "QA_util_get_next_trade_date": ("QUANTAXIS.QAUtil", "QA_util_get_next_trade_date"),
 }
 
-__all__ = sorted(list(_DIRECT_EXPORTS.keys()) + list(_LEGACY_ATTRS.keys()))
+__all__ = sorted({*_DIRECT_EXPORTS, *_LEGACY_ATTRS})
 
 
 def __getattr__(name: str):

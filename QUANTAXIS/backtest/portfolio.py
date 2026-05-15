@@ -133,15 +133,13 @@ def _mvo_weights(
         else:
             w = x0
     except ImportError:
-        # Scipy not available: use greedy approximation
-        w = np.ones(n) / n
-        # Scale by risk-adjusted return
+        # Scipy not available: min-variance proxy via inverse-covariance weighting
         inv_cov = np.linalg.pinv(cov + np.eye(n) * 1e-6)
         raw = inv_cov @ mu
-        raw = np.clip(raw, config.min_weight, config.max_weight)
         raw = np.where(np.isfinite(raw), raw, 0.0)
-        total = np.sum(raw)
-        w = raw / total if total > 0 else np.ones(n) / n
+        # Shift so all weights are positive before normalizing
+        raw = raw - raw.min() + 1e-6
+        w = raw  # _cap_and_normalize will normalize and cap
 
     return np.asarray(w, dtype=float)
 
@@ -329,6 +327,90 @@ def _black_litterman_weights(
     return _mvo_weights(posterior_cov, posterior_mu, config)
 
 
+def _cap_and_normalize(
+    weights: NDArray,
+    symbols: list[str],
+    cfg: PortfolioConfig,
+    group_map: dict[str, str] | None,
+) -> NDArray:
+    """Enforce per-asset caps and group constraints, normalize to net_exposure.
+
+    Two-phase:
+    1. Per-asset water-fill — only when n * max_w >= target (feasible).
+       When infeasible (e.g. few assets, tight cap) skip capping and just normalize.
+    2. Group constraints — scale down over-limit group assets and push
+       the freed budget to non-group assets. No further per-asset clip
+       is applied after this so the group constraint is not destroyed.
+    """
+    n = len(weights)
+    if n == 0:
+        return weights
+
+    target = cfg.net_exposure
+    max_w = cfg.max_weight
+    min_w = cfg.min_weight
+
+    w = np.where(np.isfinite(weights), weights, 0.0)
+    total = np.sum(w)
+    w = w / total * target if total > 0 else np.ones(n) / n * target
+
+    # ── Step 1: per-asset water-fill (skip when inherently infeasible) ────────
+    feasible = (n * max_w >= target - 1e-9) and (n * min_w <= target + 1e-9)
+    if feasible:
+        for _ in range(n + 2):
+            over = w > max_w + 1e-9
+            under = w < min_w - 1e-9
+            if not over.any() and not under.any():
+                break
+
+            w = np.clip(w, min_w, max_w)
+            free = (w > min_w + 1e-9) & (w < max_w - 1e-9)
+            remaining = target - np.sum(w)
+
+            if abs(remaining) < 1e-12:
+                break
+            if free.any():
+                free_sum = np.sum(w[free])
+                if free_sum > 0:
+                    w[free] += w[free] / free_sum * remaining
+                else:
+                    w[free] += remaining / free.sum()
+            else:
+                # All assets at bounds; proportionally spread (handles n=1 case)
+                s = np.sum(w)
+                w += w / s * remaining if s > 0 else np.ones(n) / n * remaining
+
+    # ── Step 2: group constraints ─────────────────────────────────────────────
+    if group_map and cfg.group_constraints:
+        for _outer in range(n + 2):
+            any_violated = False
+            for group, limit in cfg.group_constraints.items():
+                grp_idx = [i for i, s in enumerate(symbols) if group_map.get(s) == group]
+                out_idx = [i for i in range(n) if i not in grp_idx]
+                grp_total = float(np.sum(w[grp_idx]))
+                if grp_total > limit + 1e-9:
+                    any_violated = True
+                    excess = grp_total - limit
+                    for i in grp_idx:
+                        w[i] *= limit / grp_total
+                    if out_idx:
+                        out_sum = float(np.sum(w[out_idx]))
+                        if out_sum > 0:
+                            for i in out_idx:
+                                w[i] += w[i] / out_sum * excess
+                        else:
+                            for i in out_idx:
+                                w[i] += excess / len(out_idx)
+            if not any_violated:
+                break
+        # Normalize to target without per-asset clip (preserves group constraint)
+        total = np.sum(w)
+        if total > 0:
+            w = w / total * target
+
+    return w
+
+
 def optimize_portfolio(
     returns: pd.DataFrame,
     config: PortfolioConfig | None = None,
@@ -355,16 +437,10 @@ def optimize_portfolio(
     if n == 0:
         return {}
 
-    # Compute covariance
     cov = _covariance(returns, method="shrinkage")
-
-    # Compute expected returns (momentum estimate)
     mu = np.asarray(returns.mean().values, dtype=float)
-
-    # Market cap weights (equal if unknown)
     market_weights = np.ones(n) / n
 
-    # Run optimization
     method = cfg.method.lower().replace("-", "_").replace(" ", "_")
 
     if method == "mvo":
@@ -372,7 +448,7 @@ def optimize_portfolio(
     elif method == "risk_parity":
         weights = _risk_parity_weights(cov, cfg)
     elif method == "black_litterman":
-        view_indices = {}
+        view_indices: dict[int, float] = {}
         if views:
             for symbol, ret in views.items():
                 if symbol in symbols:
@@ -387,28 +463,7 @@ def optimize_portfolio(
     else:
         raise ValueError(f"unknown portfolio method: {method}")
 
-    # Apply group constraints
-    if group_map and cfg.group_constraints:
-        group_exposure: dict[str, float] = {}
-        for idx, symbol in enumerate(symbols):
-            group = group_map.get(symbol, "_other")
-            group_exposure[group] = group_exposure.get(group, 0.0) + weights[idx]
-        scale = 1.0
-        for group, limit in cfg.group_constraints.items():
-            current = group_exposure.get(group, 0.0)
-            if current > limit:
-                scale = min(scale, limit / max(current, 1e-10))
-        if scale < 1.0:
-            weights = weights * scale
-
-    # Apply weight caps
-    weights = np.clip(weights, cfg.min_weight, cfg.max_weight)
-    total = np.sum(weights)
-    if total > 0:
-        weights = weights / total * cfg.net_exposure
-    else:
-        weights = np.ones(n) / n
-
+    weights = _cap_and_normalize(weights, symbols, cfg, group_map)
     return dict(zip(symbols, np.round(weights, 6).tolist()))
 
 

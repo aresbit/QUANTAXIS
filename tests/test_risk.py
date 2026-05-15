@@ -53,8 +53,10 @@ def test_compute_sortino():
 
 
 def test_generate_risk_report():
+    import pandas as pd
     equity = [100_000 + i * 100 for i in range(100)]
-    curve = [{"datetime": f"2020-01-{i+1:02d}", "equity": e} for i, e in enumerate(equity)]
+    dates = pd.date_range("2020-01-01", periods=100, freq="D").strftime("%Y-%m-%d").tolist()
+    curve = [{"datetime": d, "equity": e} for d, e in zip(dates, equity)]
     report = generate_risk_report(curve)
     assert "sharpe" in report
     assert "max_drawdown" in report

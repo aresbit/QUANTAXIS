@@ -345,7 +345,8 @@ def factor_exposure_analysis(
     X = aligned.iloc[:, 1:].values
     n, k = X.shape
 
-    if n < k + 2:
+    # Need at least k+2 residual dof; minimum 5 obs for meaningful regression
+    if n < max(k + 3, 5):
         return {}
 
     # OLS with intercept

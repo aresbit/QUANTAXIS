@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,31 @@ from QUANTAXIS.backtest.risk import RiskChecker, RiskConfig, generate_risk_repor
 from QUANTAXIS.backtest.strategy import RecursiveQTransformerStrategy
 
 logger = logging.getLogger("quantaxis.backtest")
+
+
+# ── Strategy protocol: anything with score_frame() qualifies ─────────────────
+
+@runtime_checkable
+class StrategyProtocol(Protocol):
+    def score_frame(self, df: pd.DataFrame) -> pd.DataFrame: ...
+
+
+# ── Unified engine config ────────────────────────────────────────────────────
+
+@dataclass
+class EngineConfig:
+    """Top-level config covering both backtest and live-paper modes."""
+
+    initial_cash: float = 1_000_000.0
+    commission_rate: float = 0.0003
+    stamp_duty_rate: float = 0.001
+    slippage_model: str = "fixed"         # "fixed" | "percent" | "vwap"
+    slippage_value: float = 0.0
+    bars_per_year: int = 252
+    portfolio_size: int = 3
+    execution_mode: str = "research"       # "research" | "paper" | "paper_strict" | "live"
+    impact_model: str = "none"             # "none" | "square_root" | "linear" | "almgren_chriss"
+    impact_coefficient: float = 0.03
 
 
 @dataclass(slots=True)
@@ -210,7 +236,7 @@ def _walk_forward_impact_adjustment(
 
 def run_backtest(
     data: pd.DataFrame,
-    strategy: RecursiveQTransformerStrategy,
+    strategy: StrategyProtocol | RecursiveQTransformerStrategy,
     initial_cash: float = 1_000_000,
     commission_rate: float = 0.0003,
     stamp_duty_rate: float = 0.001,
@@ -221,9 +247,26 @@ def run_backtest(
     impact_config: ImpactConfig | None = None,
     portfolio_config: PortfolioConfig | None = None,
     execution_mode: str = "research",
+    engine_config: EngineConfig | None = None,
 ) -> BacktestResult:
-    if execution_mode not in {"research", "paper", "paper_strict"}:
-        raise ValueError("execution_mode must be one of: research, paper, paper_strict")
+    # EngineConfig overrides individual kwargs when provided
+    if engine_config is not None:
+        initial_cash = engine_config.initial_cash
+        commission_rate = engine_config.commission_rate
+        stamp_duty_rate = engine_config.stamp_duty_rate
+        slippage_model = engine_config.slippage_model
+        slippage_value = engine_config.slippage_value
+        bars_per_year = engine_config.bars_per_year
+        portfolio_size = engine_config.portfolio_size
+        execution_mode = engine_config.execution_mode
+        if impact_config is None and engine_config.impact_model != "none":
+            impact_config = ImpactConfig(
+                model=engine_config.impact_model,
+                impact_coefficient=engine_config.impact_coefficient,
+            )
+
+    if execution_mode not in {"research", "paper", "paper_strict", "live"}:
+        raise ValueError("execution_mode must be one of: research, paper, paper_strict, live")
     required = {"datetime", "open", "high", "low", "close", "volume"}
     missing = required - set(data.columns)
     if missing:
@@ -239,7 +282,7 @@ def run_backtest(
     df[symbol_column] = df[symbol_column].astype(str)
     df["datetime"] = pd.to_datetime(df["datetime"])
 
-    if execution_mode in {"paper", "paper_strict"}:
+    if execution_mode in {"paper", "paper_strict", "live"}:
         if impact_config is None:
             impact_config = ImpactConfig(model="square_root", impact_coefficient=0.03)
         if slippage_model == "fixed" and slippage_value == 0.0:

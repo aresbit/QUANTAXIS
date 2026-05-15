@@ -1,7 +1,7 @@
 [project]
 name = "quantaxis"
 version = "3.0.0"
-description = "Minimal QUANTAXIS build for China A-share trading"
+description = "QUANTAXIS quant trading system with OKX live trading and finance MCP"
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
@@ -14,6 +14,14 @@ dependencies = [
 [project.optional-dependencies]
 live = [
   "easytrader>=0.23.7",
+  "websocket-client>=1.8.0",
+]
+okx = [
+  "websocket-client>=1.8.0",
+  "pyyaml>=6.0",
+]
+longbridge = [
+  "longbridge>=4.1.0",
 ]
 research = [
   "akshare>=1.17",

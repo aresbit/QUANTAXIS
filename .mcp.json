@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "finance-tools": {
+      "command": "uvx",
+      "args": ["finance-tools-mcp"],
+      "env": {}
+    },
+    "longbridge": {
+      "command": "python3",
+      "args": ["/home/ares/yyscode/btcquant/mcp_servers/longbridge_mcp.py"],
+      "env": {
+        "LONGBRIDGE_APP_KEY": "${LONGBRIDGE_APP_KEY}",
+        "LONGBRIDGE_APP_SECRET": "${LONGBRIDGE_APP_SECRET}",
+        "LONGBRIDGE_ACCESS_TOKEN": "${LONGBRIDGE_ACCESS_TOKEN}",
+        "LONGBRIDGE_REGION": "cn"
+      }
+    },
+    "okx-market": {
+      "command": "python3",
+      "args": ["/home/ares/yyscode/btcquant/mcp_servers/okx_market_mcp.py"],
+      "env": {}
+    }
+  }
+}

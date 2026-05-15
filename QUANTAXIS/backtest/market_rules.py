@@ -25,7 +25,7 @@ class MarketContext:
 
     @property
     def price_range(self) -> float:
-        return self.high_price - self.low_price if self.high_price > self.low_price else 0.0
+        return round(self.high_price - self.low_price, 8) if self.high_price > self.low_price else 0.0
 
     @property
     def effective_limit_up(self) -> float:
@@ -156,7 +156,7 @@ def can_trade(
 
 def build_market_contexts(
     snapshot: pd.DataFrame,
-    prev_snapshot: pd.DataFrame | None,
+    prev_snapshot: pd.DataFrame | None = None,
     symbol_groups: dict[str, str] | None = None,
 ) -> dict[str, MarketContext]:
     """Build MarketContext for each symbol in a bar snapshot."""

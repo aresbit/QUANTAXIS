@@ -1,0 +1,28 @@
+# OKX Live Trading Configuration
+# Copy this file to config.okx.local.yaml (gitignored) and fill in your credentials.
+
+okx:
+  api_key: ""          # OKX API Key
+  secret_key: ""       # OKX Secret Key
+  passphrase: ""       # OKX API Passphrase
+  simulated: true      # true = 模拟盘(paper trading), false = 实盘
+
+trader:
+  inst_id: "BTC-USDT-SWAP"   # 交易品种
+  bar: "1H"                   # K线周期: 1m/5m/15m/1H/4H/1D
+  lookback: 64                # 策略回望K线数
+  td_mode: "cross"            # 保证金模式: cash / cross / isolated
+  leverage: 3                 # 杠杆倍数 (cash模式忽略)
+
+risk:
+  max_position_usdt: 500.0    # 单边最大持仓金额(USDT)
+  max_daily_loss_usdt: 100.0  # 单日最大亏损触发熔断
+  max_order_usdt: 200.0       # 单笔最大下单金额
+  min_signal_threshold: 0.03  # 最小信号强度阈值
+  cooldown_bars: 3            # 交易后冷却K线数
+
+longbridge:
+  app_key: ""          # 长桥 App Key
+  app_secret: ""       # 长桥 App Secret
+  access_token: ""     # 长桥 Access Token
+  region: "cn"         # cn / us
